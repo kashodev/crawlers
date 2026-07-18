@@ -1,0 +1,50 @@
+# Ontario Legislative Assembly — bills and their PDF texts.
+name: ontario-legislative-bills
+module: ontario_legislative_bills
+
+# Index of every parliament/session. The crawler walks it newest-first.
+seeds:
+  - https://www.ola.org/en/legislative-business/bills/all
+
+politeness:
+  user_agent: "pdf-research-crawler/1.0 (+RAG test-data collection; contact: kasho.dev@gmail.com)"
+  # ola.org declares no Crawl-delay, so this floor is what protects it.
+  min_delay_seconds: 1.5
+  respect_robots: true
+  max_concurrent_requests: 2
+  jitter_seconds: 0.4
+
+retry:
+  max_attempts: 4
+  backoff_base_seconds: 2.0
+  backoff_max_seconds: 60.0
+  timeout_seconds: 60.0
+  download_timeout_seconds: 300.0
+
+limits:
+  # Each bill page is a deliberate visit rather than a blind probe, so a long
+  # miss streak here means the page structure changed — worth stopping on.
+  consecutive_miss_limit: 1000
+  per_unit_miss_limit: 100
+  max_documents: null
+  max_pages: null
+  max_pdf_bytes: 536870912
+
+storage:
+  backend: local
+  local_root: data
+  prefix: ontario_legislative_bills
+
+metadata:
+  backend: local
+  local_root: data/_metadata
+  documents_collection: documents
+  jobs_collection: jobs
+  batch_size: 400
+
+options:
+  base_url: https://www.ola.org
+  # Restrict to specific parliaments, e.g. [44, 43]. Empty = all, newest first.
+  parliaments: []
+  # Bills exist in English and French; "_e" / "_f" suffixes on the PDF name.
+  languages: ["e"]

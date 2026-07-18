@@ -1,0 +1,61 @@
+# City of Toronto — municipal bylaws.
+#
+# NOTE ON SOURCE: the public Bylaw Status Registry UI
+# (/city-government/public-notices-bylaws/.../search-bylaw-status-registry/)
+# is a JavaScript app backed by secure.toronto.ca APIs that sit behind Akamai
+# and return "Access Denied" to non-browser clients. Rather than impersonate a
+# browser, this crawler uses the canonical PDF store on the main site,
+# www.toronto.ca/legdocs/bylaws/{year}/law{NNNN}.pdf, which serves the same
+# documents, is permitted by robots.txt, and is cheap to probe with HEAD.
+name: toronto-bylaws
+module: toronto_bylaws
+
+seeds:
+  - https://www.toronto.ca/legdocs/bylaws/
+
+politeness:
+  user_agent: "pdf-research-crawler/1.0 (+RAG test-data collection; contact: kasho.dev@gmail.com)"
+  # Enumeration issues many requests, so pace it more conservatively than OLA.
+  min_delay_seconds: 1.0
+  respect_robots: true
+  max_concurrent_requests: 2
+  jitter_seconds: 0.3
+
+retry:
+  max_attempts: 4
+  backoff_base_seconds: 2.0
+  backoff_max_seconds: 60.0
+  timeout_seconds: 45.0
+  download_timeout_seconds: 300.0
+
+limits:
+  # Global stop: 1000 consecutive probes with no PDF ends the crawl entirely.
+  consecutive_miss_limit: 1000
+  # Within one year, tolerate this many consecutive gaps before moving to the
+  # previous year. Bylaw numbering has holes, so this must exceed the largest
+  # expected gap without walking the whole keyspace.
+  per_unit_miss_limit: 75
+  max_documents: null
+  max_pages: null
+  max_pdf_bytes: 536870912
+
+storage:
+  backend: local
+  local_root: data
+  prefix: toronto_bylaws
+
+metadata:
+  backend: local
+  local_root: data/_metadata
+  documents_collection: documents
+  jobs_collection: jobs
+  batch_size: 400
+
+options:
+  pdf_url_template: "https://www.toronto.ca/legdocs/bylaws/{year}/law{number:04d}.pdf"
+  # Newest year to probe. null = current calendar year.
+  start_year: null
+  # Oldest year to probe. Verified coverage reaches back to 1998.
+  end_year: 1998
+  # Highest bylaw number to consider in any year. Recent years run to ~1400.
+  max_number_per_year: 2000

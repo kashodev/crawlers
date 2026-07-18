@@ -1,0 +1,11 @@
+.env
+*.key.json
+service-account*.json
+
+.venv/
+__pycache__/
+*.py[cod]
+
+# Crawled artifacts and local metadata store
+data/
+!data/.gitkeep

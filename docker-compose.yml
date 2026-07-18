@@ -1,0 +1,21 @@
+# Local runs. PDFs and metadata land in ./data on the host, so results survive
+# the container. Mirrors how Cloud Run executes the image, minus the GCP backends.
+#
+#   docker compose run --rm crawler --site toronto_bylaws --max-documents 5
+#   docker compose run --rm crawler --site ontario_legislative_bills --dry-run
+services:
+  crawler:
+    build: .
+    image: pdf-crawler:local
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      # Configs mounted read-only so a YAML edit doesn't need a rebuild.
+      - ./ontario_legislative_bills/config.yaml:/app/ontario_legislative_bills/config.yaml:ro
+      - ./toronto_bylaws/config.yaml:/app/toronto_bylaws/config.yaml:ro
+      # Uncomment to use a service-account key locally; also set
+      # GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa.json in .env
+      # - ./service-account.json:/secrets/sa.json:ro
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
