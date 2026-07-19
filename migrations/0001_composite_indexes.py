@@ -19,6 +19,8 @@ import json
 import time
 from pathlib import Path
 
+from migrations.errors import MigrationDeferred
+
 ID = "0001_composite_indexes"
 DESCRIPTION = "Create composite indexes for resume queries"
 KIND = "declarative"
@@ -60,6 +62,27 @@ def apply(ctx) -> dict:
     declared = _declared()
 
     created, existing = [], []
+
+    try:
+        return _reconcile(ctx, client, declared, created, existing)
+    except gexc.PermissionDenied as exc:
+        # Indexes are not a prerequisite for running the crawler — it degrades
+        # to a slower resume path without them — so a missing permission should
+        # not block the rollout. Deferring keeps this migration pending so it
+        # retries once the role is granted.
+        raise MigrationDeferred(
+            f"no permission to manage Firestore indexes: {exc}",
+            remedy=(
+                "grant the migration service account roles/datastore.indexAdmin "
+                "(IAM changes can take a few minutes to propagate), then re-run "
+                "the migrate job"
+            ),
+        ) from exc
+
+
+def _reconcile(ctx, client, declared, created, existing) -> dict:
+    from google.api_core import exceptions as gexc
+    from google.cloud import firestore_admin_v1 as admin
 
     for index_spec in declared:
         collection = index_spec["collectionGroup"]

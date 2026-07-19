@@ -44,6 +44,7 @@ load_env()
 
 from common import config as config_module  # noqa: E402
 from common.metadata import MetadataRepository, build_repository  # noqa: E402
+from migrations.errors import MigrationDeferred  # noqa: E402
 from utils.logging_config import configure_logging  # noqa: E402
 
 log = logging.getLogger("migrations")
@@ -147,8 +148,19 @@ class Ledger:
         if self._client is not None:
             self._collection.document(migration_id).set(record, merge=True)
         else:
+            # Merge, mirroring Firestore's merge=True. Overwriting would drop
+            # fields the partial updates don't carry — notably `checksum`,
+            # written at claim time and not repeated by complete()/fail(),
+            # which then reads back as None and looks like drift on every run.
             path = self._local_dir / f"{migration_id}.json"  # type: ignore[operator]
-            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            existing = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    existing = {}
+            existing.update(record)
+            path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     def claim(self, migration: Migration) -> tuple[bool, str]:
         """Try to take ownership of a migration.
@@ -196,6 +208,19 @@ class Ledger:
         if progress:
             record["progress"] = progress
         self._write(migration.id, record)
+
+    def defer(self, migration: Migration, reason: str, remedy: str | None) -> None:
+        # Deliberately not COMPLETED: _claim_decision treats any non-COMPLETED
+        # status as retryable, so the next run picks this up again.
+        self._write(
+            migration.id,
+            {
+                "status": "DEFERRED",
+                "finished_at": _now(),
+                "error": reason,
+                "remedy": remedy,
+            },
+        )
 
     def save_progress(self, migration_id: str, progress: dict) -> None:
         self._write(migration_id, {"progress": progress, "updated_at": _now()})
@@ -277,6 +302,7 @@ def run(args) -> int:
 
     failures = 0
     drifted = 0
+    deferred = 0
 
     for migration in migrations:
         record = ledger.get(migration.id) or {}
@@ -329,6 +355,15 @@ def run(args) -> int:
             result = migration.apply(context)
             ledger.complete(migration, result)
             log.info("Migration applied", extra={"id": migration.id, "result": result or {}})
+        except MigrationDeferred as exc:
+            # Not a prerequisite for the new code. Record it as unfinished so
+            # the next run retries, but let the deploy proceed.
+            deferred += 1
+            ledger.defer(migration, str(exc), exc.remedy)
+            log.warning(
+                "Migration deferred; continuing",
+                extra={"id": migration.id, "reason": str(exc), "remedy": exc.remedy},
+            )
         except Exception as exc:
             failures += 1
             ledger.fail(migration, f"{type(exc).__name__}: {exc}", context.progress)
@@ -341,6 +376,11 @@ def run(args) -> int:
             "Some migrations drifted from their applied version; "
             "review them and either revert the edit or add a new migration",
             extra={"drifted": drifted},
+        )
+    if deferred:
+        log.warning(
+            "Some migrations were deferred and will be retried on the next run",
+            extra={"deferred": deferred},
         )
     return 1 if failures else 0
 

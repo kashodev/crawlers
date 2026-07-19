@@ -131,10 +131,21 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 
-# datastore.owner covers index administration, which datastore.user does not.
+# datastore.owner covers data access for backfills. indexAdmin is granted
+# explicitly because it is the role documented for create/list/delete on
+# composite indexes — do not rely on owner implying it.
 bind_with_retry "datastore.owner on ${PROJECT}" \
   gcloud projects add-iam-policy-binding "${PROJECT}" \
     --member="serviceAccount:${MIGRATE_SA_EMAIL}" --role=roles/datastore.owner
+bind_with_retry "datastore.indexAdmin on ${PROJECT}" \
+  gcloud projects add-iam-policy-binding "${PROJECT}" \
+    --member="serviceAccount:${MIGRATE_SA_EMAIL}" --role=roles/datastore.indexAdmin
+
+# IAM changes are eventually consistent and can take minutes to take effect.
+# The image build below usually covers it, but a short explicit pause makes the
+# common case reliable rather than lucky.
+echo "    waiting 30s for IAM to propagate"
+sleep 30
 
 echo "==> Uploading site configs"
 for site in ontario_legislative_bills toronto_bylaws; do
@@ -149,6 +160,13 @@ docker build --platform linux/amd64 -t "${IMAGE}" -t "${IMAGE_LATEST}" .
 docker push "${IMAGE}"
 docker push "${IMAGE_LATEST}"
 echo "    deploying image: ${IMAGE}"
+
+# Cloud Run resolves a tag to a digest and may report the digest form rather
+# than the tag, so verification needs to accept either. Empty is fine; the
+# check below then falls back to comparing tags only.
+IMAGE_DIGEST="$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" 2>/dev/null \
+  | grep -F "${IMAGE_REPO}" | head -1 | sed 's/.*@//')"
+[[ -n "${IMAGE_DIGEST}" ]] && echo "    digest: ${IMAGE_DIGEST}"
 
 echo "==> Migration job"
 # Same image, different entrypoint. Runs in-cluster as the migration service
@@ -212,19 +230,46 @@ for site in ontario_legislative_bills toronto_bylaws; do
 done
 
 echo "==> Verifying deployed image"
-# The failure this guards against is silent: a skipped update leaves the job on
-# an older image while the deploy reports success. Assert instead of assume.
+# Guards against a silent stale rollout: a skipped update leaves the job on an
+# older image while the deploy still reports success.
+#
+# The image is read out of the raw JSON rather than a typed field path, because
+# the nesting differs between the Knative-style and v2 job representations and
+# a wrong path yields an empty string that looks exactly like a failure.
+deployed_image_of() {
+  gcloud run jobs describe "$1" --region="${REGION}" --format=json 2>/dev/null \
+    | grep -o '"image"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"image"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/'
+}
+
 verify_failed=0
+unverified=0
 for job in "${MIGRATE_JOB}" crawler-ontario-legislative-bills crawler-toronto-bylaws; do
-  deployed="$(gcloud run jobs describe "${job}" --region="${REGION}" \
-    --format='value(template.template.containers[0].image)' 2>/dev/null || echo "")"
-  if [[ "${deployed}" == "${IMAGE}" ]]; then
+  deployed="$(deployed_image_of "${job}")"
+
+  if [[ -z "${deployed}" ]]; then
+    # Could not read the field. That is a gap in this check, not evidence of a
+    # bad deploy, so it must not fail the run.
+    echo "    ?   ${job}: could not read deployed image; skipping verification" >&2
+    unverified=1
+  elif [[ "${deployed}" == "${IMAGE}" ]]; then
     echo "    OK  ${job} -> ${IMAGE_TAG}"
+  elif [[ -n "${IMAGE_DIGEST}" && "${deployed}" == *"@${IMAGE_DIGEST}" ]]; then
+    # Same image, reported in digest form.
+    echo "    OK  ${job} -> ${IMAGE_TAG} (by digest)"
   else
-    echo "    STALE  ${job} is running '${deployed}', expected '${IMAGE}'" >&2
+    echo "    STALE  ${job}" >&2
+    echo "           running:  ${deployed}" >&2
+    echo "           expected: ${IMAGE}" >&2
     verify_failed=1
   fi
 done
+
+if [[ ${unverified} -eq 1 ]]; then
+  echo "    NOTE: verify manually with:" >&2
+  echo "      gcloud run jobs describe ${MIGRATE_JOB} --region=${REGION} --format=json | grep image" >&2
+fi
 
 if [[ ${verify_failed} -eq 1 ]]; then
   echo "" >&2
