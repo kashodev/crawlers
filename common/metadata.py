@@ -35,6 +35,19 @@ class MetadataRepository(ABC):
     def save_job(self, job: JobRecord) -> None: ...
 
     @abstractmethod
+    def find_running_jobs(self, limit: int = 200) -> list[dict]:
+        """Jobs still marked RUNNING, across all sites.
+
+        Filtered on status alone — a single-field index every Firestore
+        database has by default — so the stale sweep needs no composite index.
+        Callers narrow by site in memory; the set of stuck jobs is small.
+        """
+
+    @abstractmethod
+    def update_job(self, job_id: str, fields: dict) -> None:
+        """Merge partial fields into an existing job record."""
+
+    @abstractmethod
     def get_checkpoint(self, checkpoint_id: str) -> dict | None: ...
 
     @abstractmethod
@@ -111,6 +124,27 @@ class LocalMetadataRepository(MetadataRepository):
         (self.jobs_dir / f"{job.job_id}.json").write_text(
             json.dumps(job.to_dict(), indent=2), encoding="utf-8"
         )
+
+    def find_running_jobs(self, limit: int = 200) -> list[dict]:
+        running = []
+        for path in self.jobs_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if record.get("status") == "RUNNING":
+                running.append(record)
+                if len(running) >= limit:
+                    break
+        return running
+
+    def update_job(self, job_id: str, fields: dict) -> None:
+        path = self.jobs_dir / f"{job_id}.json"
+        if not path.exists():
+            return
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(fields)
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
     def get_checkpoint(self, checkpoint_id: str) -> dict | None:
         path = self.checkpoints_dir / f"{checkpoint_id}.json"
@@ -216,6 +250,21 @@ class FirestoreMetadataRepository(MetadataRepository):
 
     def save_job(self, job: JobRecord) -> None:
         self._jobs.document(job.job_id).set(job.to_dict(), merge=True)
+
+    def find_running_jobs(self, limit: int = 200) -> list[dict]:
+        from google.cloud import firestore
+
+        try:
+            query = self._jobs.where(
+                filter=firestore.FieldFilter("status", "==", "RUNNING")
+            ).limit(limit)
+            return [doc.to_dict() for doc in query.stream()]
+        except Exception as exc:
+            log.warning("Could not query running jobs", extra={"error": str(exc)})
+            return []
+
+    def update_job(self, job_id: str, fields: dict) -> None:
+        self._jobs.document(job_id).set(fields, merge=True)
 
     def get_checkpoint(self, checkpoint_id: str) -> dict | None:
         snapshot = self._checkpoints.document(checkpoint_id).get()

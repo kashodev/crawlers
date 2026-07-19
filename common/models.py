@@ -26,6 +26,12 @@ class JobStatus(str, Enum):
     # Ended early on a configured limit (miss streak / max documents) rather
     # than an error. Distinct from FAILED so alerting doesn't page on it.
     STOPPED_EARLY = "STOPPED_EARLY"
+    # Left RUNNING with no heartbeat: killed without warning (console cancel
+    # that outran the SIGTERM grace period, SIGKILL, OOM, node preemption).
+    # Deliberately distinct from FAILED — the run did not report an error, we
+    # simply never heard from it again — and from a hypothetical CANCELLED,
+    # since we cannot tell from Firestore alone whether a human stopped it.
+    STALE = "STALE"
 
 
 @dataclass
@@ -104,6 +110,9 @@ class JobRecord:
     status: str = JobStatus.RUNNING.value
     started_at: str = field(default_factory=_now)
     finished_at: str | None = None
+    # Refreshed while the crawl runs. Its absence past a threshold is what
+    # identifies a job that died without being able to report it.
+    last_heartbeat_at: str = field(default_factory=_now)
     task_index: int = 0
     task_count: int = 1
     # Where this run picked up from, and how that position was recovered

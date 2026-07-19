@@ -15,7 +15,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from common.config import SiteConfig
@@ -27,6 +27,12 @@ from utils.hashing import doc_id as make_doc_id
 from utils.hashing import sha256_bytes, shard_index
 
 log = logging.getLogger(__name__)
+
+# How often a running job refreshes its heartbeat.
+HEARTBEAT_INTERVAL_SECONDS = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
+# How long a RUNNING job may go without a heartbeat before it is presumed dead.
+# Must stay well above the heartbeat interval so a slow task is never swept.
+STALE_AFTER_SECONDS = float(os.environ.get("STALE_JOB_AFTER_SECONDS", "900"))
 
 
 @dataclass
@@ -99,6 +105,7 @@ class BaseCrawler(ABC):
         self._consecutive_misses = 0
         self._shutdown_reason: str | None = None
         self._since_checkpoint = 0
+        self._last_heartbeat = time.monotonic()
 
         self.resume = self.load_resume_state()
         self.job.resumed_from = self.resume.cursor
@@ -344,6 +351,103 @@ class BaseCrawler(ABC):
         self._checkpoint.sweep_complete = True
         self.save_checkpoint()
 
+    # --- liveness -----------------------------------------------------------
+
+    def _maybe_heartbeat(self) -> None:
+        """Refresh the job's heartbeat, at most once per interval.
+
+        Time-bounded rather than per-document so the write rate stays flat
+        whether the crawl is downloading large PDFs slowly or skipping
+        thousands of already-stored ones quickly.
+        """
+        now = time.monotonic()
+        if now - self._last_heartbeat < HEARTBEAT_INTERVAL_SECONDS:
+            return
+        self._last_heartbeat = now
+        self.job.last_heartbeat_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.repo.update_job(
+                self.job.job_id,
+                {
+                    "last_heartbeat_at": self.job.last_heartbeat_at,
+                    "discovered": self.job.discovered,
+                    "downloaded": self.job.downloaded,
+                    "skipped": self.job.skipped,
+                    "failed": self.job.failed,
+                },
+            )
+        except Exception as exc:
+            # Losing a heartbeat is not worth failing a crawl over; the worst
+            # case is this job being swept as STALE later.
+            log.warning("Heartbeat write failed", extra={"error": str(exc)})
+
+    def sweep_stale_jobs(self) -> int:
+        """Mark abandoned RUNNING jobs for this site as STALE.
+
+        A job killed without a usable grace period — a console cancellation
+        that outran SIGTERM, SIGKILL, OOM, preemption — never gets to write a
+        terminal status, so it sits at RUNNING forever. Any RUNNING job whose
+        heartbeat is older than the threshold is therefore presumed dead.
+
+        The threshold is far larger than the heartbeat interval, so a merely
+        slow task is never mistaken for a dead one.
+        """
+        threshold = timedelta(seconds=STALE_AFTER_SECONDS)
+        now = datetime.now(timezone.utc)
+        swept = 0
+
+        try:
+            candidates = self.repo.find_running_jobs()
+        except Exception as exc:
+            log.warning("Stale-job sweep skipped", extra={"error": str(exc)})
+            return 0
+
+        for record in candidates:
+            job_id = record.get("job_id")
+            if not job_id or job_id == self.job.job_id:
+                continue
+            if record.get("site") != self.config.name:
+                continue
+
+            # started_at covers a job that died before its first heartbeat.
+            stamp = record.get("last_heartbeat_at") or record.get("started_at")
+            try:
+                last_seen = datetime.fromisoformat(stamp)
+            except (TypeError, ValueError):
+                log.debug("Job has no usable timestamp; leaving it", extra={"jobId": job_id})
+                continue
+
+            age = now - last_seen
+            if age < threshold:
+                continue
+
+            self.repo.update_job(
+                job_id,
+                {
+                    "status": JobStatus.STALE.value,
+                    "finished_at": now.isoformat(),
+                    "stop_reason": (
+                        f"no heartbeat for {int(age.total_seconds())}s; "
+                        "presumed killed (cancellation, preemption, or OOM)"
+                    ),
+                    "marked_stale_at": now.isoformat(),
+                    "marked_stale_by": self.job.job_id,
+                },
+            )
+            swept += 1
+            log.warning(
+                "Marked abandoned job STALE",
+                extra={
+                    "jobId": job_id,
+                    "ageSeconds": int(age.total_seconds()),
+                    "lastSeen": stamp,
+                },
+            )
+
+        if swept:
+            log.info("Stale-job sweep complete", extra={"marked": swept})
+        return swept
+
     # --- graceful shutdown -------------------------------------------------
 
     def _install_signal_handlers(self) -> None:
@@ -511,9 +615,15 @@ class BaseCrawler(ABC):
         )
         self.repo.save_job(self.job)
 
+        # Only one task needs to sweep; the writes are identical either way,
+        # but there is no reason for every shard to repeat the scan.
+        if self.task_index == 0:
+            self.sweep_stale_jobs()
+
         try:
             for candidate in self.discover():
                 self._check_shutdown()
+                self._maybe_heartbeat()
                 self.job.discovered += 1
                 self.process(candidate)
 

@@ -69,6 +69,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="print the saved resume position for the site and exit",
     )
+    parser.add_argument(
+        "--sweep-stale",
+        action="store_true",
+        help="mark abandoned RUNNING jobs as STALE and exit (no crawling)",
+    )
     parser.add_argument("--list-sites", action="store_true")
     return parser.parse_args(argv)
 
@@ -112,6 +117,18 @@ def main(argv: list[str] | None = None) -> int:
         cfg.politeness.min_delay_seconds = args.min_delay
 
     crawler = load_crawler_class(cfg.module)(cfg, job_id=args.job_id)
+
+    if args.sweep_stale:
+        # This run's own job record is never a candidate, so sweeping here is
+        # safe even though constructing the crawler created one.
+        swept = crawler.sweep_stale_jobs()
+        crawler.repo.update_job(
+            crawler.job.job_id,
+            {"status": JobStatus.COMPLETED.value, "stop_reason": "stale sweep only"},
+        )
+        crawler.client.close()
+        print(f"marked {swept} job(s) STALE")
+        return 0
 
     if args.dry_run:
         log.info("Dry run: discovering candidates only", extra={"site": cfg.name})

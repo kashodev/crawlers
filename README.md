@@ -93,9 +93,39 @@ Document states: `DISCOVERED` → `DOWNLOADED` / `FAILED` / `SKIPPED`. Failures
 record the error, HTTP status, and attempt count. A body that isn't really a
 PDF (an HTML error page served as 200) is a failure, not a stored file.
 
-Job states: `RUNNING` → `COMPLETED` / `STOPPED_EARLY` / `FAILED`.
+Job states: `RUNNING` → `COMPLETED` / `STOPPED_EARLY` / `FAILED` / `STALE`.
 `STOPPED_EARLY` means a configured limit was hit (miss streak or document cap)
 and is a normal outcome; only `FAILED` exits non-zero so Cloud Run retries it.
+
+### Abandoned jobs (`STALE`)
+
+A job killed without a usable grace period — a console cancellation that
+outruns `SIGTERM`, a `SIGKILL`, an OOM, a preempted node — never gets to write
+a terminal status and would otherwise sit at `RUNNING` forever.
+
+Running jobs refresh `last_heartbeat_at` every 30s
+(`HEARTBEAT_INTERVAL_SECONDS`), on a timer rather than per document so the
+write rate stays flat regardless of crawl speed. At startup each crawl sweeps
+its own site: any `RUNNING` job whose heartbeat is older than 15 minutes
+(`STALE_JOB_AFTER_SECONDS`) is marked `STALE` with the age recorded in
+`stop_reason`. Jobs that died before their first heartbeat fall back to
+`started_at`. Only task 0 sweeps, and a job never sweeps itself.
+
+`STALE` is deliberately distinct from `FAILED` (the run reported no error — we
+simply stopped hearing from it) and from a hypothetical `CANCELLED`, since
+Firestore alone can't tell a human cancellation from a preemption. Attributing
+that properly would mean reconciling against the Cloud Run Admin API, which
+this intentionally avoids.
+
+The threshold is 30× the heartbeat interval, so a slow task is never mistaken
+for a dead one. If a live job were swept anyway (say, a Firestore outage
+blocked its heartbeats), the effect is transient: when it finishes it writes
+its own terminal status over the `STALE` one.
+
+```bash
+# Sweep without crawling
+docker compose run --rm crawler --site toronto_bylaws --sweep-stale
+```
 
 **Stop rule:** 1000 consecutive probes yielding no PDF ends the run completely
 (`limits.consecutive_miss_limit`). Within one Toronto year,
