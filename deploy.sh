@@ -52,12 +52,46 @@ echo "==> Service account (least privilege: these two resources only)"
 gcloud iam service-accounts describe "${SA_EMAIL}" >/dev/null 2>&1 || \
   gcloud iam service-accounts create "${SA}" --display-name="PDF crawler job"
 
-for bucket in "${PDF_BUCKET}" "${CONFIG_BUCKET}"; do
-  gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
-    --member="serviceAccount:${SA_EMAIL}" --role=roles/storage.objectAdmin >/dev/null
+# A freshly created service account is not immediately visible to the IAM
+# policy APIs, which then reject bindings with "does not exist". Wait for it to
+# propagate rather than racing it.
+echo "==> Waiting for service account to propagate"
+for attempt in $(seq 1 30); do
+  if gcloud iam service-accounts describe "${SA_EMAIL}" >/dev/null 2>&1; then
+    break
+  fi
+  if [[ ${attempt} -eq 30 ]]; then
+    echo "ERROR: ${SA_EMAIL} still not visible after 60s" >&2
+    exit 1
+  fi
+  sleep 2
 done
-gcloud projects add-iam-policy-binding "${PROJECT}" \
-  --member="serviceAccount:${SA_EMAIL}" --role=roles/datastore.user >/dev/null
+
+# Even after it is describable, policy propagation can lag a few more seconds,
+# so retry the bindings themselves instead of failing the whole deploy.
+bind_with_retry() {
+  local description="$1"; shift
+  for attempt in $(seq 1 10); do
+    if "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ ${attempt} -eq 10 ]]; then
+      echo "ERROR: ${description} failed after 10 attempts; last error:" >&2
+      "$@" >&2 || true   # re-run once unsuppressed so the real error is visible
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+for bucket in "${PDF_BUCKET}" "${CONFIG_BUCKET}"; do
+  bind_with_retry "objectAdmin on gs://${bucket}" \
+    gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
+      --member="serviceAccount:${SA_EMAIL}" --role=roles/storage.objectAdmin
+done
+bind_with_retry "datastore.user on ${PROJECT}" \
+  gcloud projects add-iam-policy-binding "${PROJECT}" \
+    --member="serviceAccount:${SA_EMAIL}" --role=roles/datastore.user
 
 echo "==> Uploading site configs"
 for site in ontario_legislative_bills toronto_bylaws; do
