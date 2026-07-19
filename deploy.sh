@@ -17,7 +17,26 @@ REGION="${2:-northamerica-northeast2}"   # Toronto region: closest to the source
 # just a throughput one. 1 for routine runs; 2-4 is reasonable for a backfill.
 TASKS="${3:-1}"
 REPO="crawler-repo"
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/crawler:latest"
+# Immutable, unique tag per deploy.
+#
+# A fixed tag like :latest makes the --image string identical on every deploy,
+# so `gcloud run jobs update` sees no spec change, skips the update, and the job
+# goes on executing whatever digest it resolved the first time — a silent stale
+# rollout. A tag that changes whenever the build does forces the update through.
+#
+# Clean tree -> the commit SHA, so a deployed image is traceable to source.
+# Dirty tree -> SHA plus a timestamp, because the SHA alone would describe code
+# that is not what is in the image.
+IMAGE_REPO="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/crawler"
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+if git rev-parse --git-dir >/dev/null 2>&1 && ! git diff-index --quiet HEAD -- 2>/dev/null; then
+  IMAGE_TAG="${GIT_SHA}-dirty-$(date -u +%Y%m%d%H%M%S)"
+  echo "NOTE: uncommitted changes present; tagging image ${IMAGE_TAG}"
+else
+  IMAGE_TAG="${GIT_SHA}"
+fi
+IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+IMAGE_LATEST="${IMAGE_REPO}:latest"
 PDF_BUCKET="${PROJECT}-pdf-archive"
 CONFIG_BUCKET="${PROJECT}-crawler-config"
 SA="pdf-crawler"
@@ -124,8 +143,12 @@ done
 
 echo "==> Building and pushing image (linux/amd64 for Cloud Run)"
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet >/dev/null
-docker build --platform linux/amd64 -t "${IMAGE}" .
+# :latest is pushed alongside as a convenience pointer, but the job specs
+# always reference the immutable tag.
+docker build --platform linux/amd64 -t "${IMAGE}" -t "${IMAGE_LATEST}" .
 docker push "${IMAGE}"
+docker push "${IMAGE_LATEST}"
+echo "    deploying image: ${IMAGE}"
 
 echo "==> Migration job"
 # Same image, different entrypoint. Runs in-cluster as the migration service
@@ -188,7 +211,32 @@ for site in ontario_legislative_bills toronto_bylaws; do
   fi
 done
 
+echo "==> Verifying deployed image"
+# The failure this guards against is silent: a skipped update leaves the job on
+# an older image while the deploy reports success. Assert instead of assume.
+verify_failed=0
+for job in "${MIGRATE_JOB}" crawler-ontario-legislative-bills crawler-toronto-bylaws; do
+  deployed="$(gcloud run jobs describe "${job}" --region="${REGION}" \
+    --format='value(template.template.containers[0].image)' 2>/dev/null || echo "")"
+  if [[ "${deployed}" == "${IMAGE}" ]]; then
+    echo "    OK  ${job} -> ${IMAGE_TAG}"
+  else
+    echo "    STALE  ${job} is running '${deployed}', expected '${IMAGE}'" >&2
+    verify_failed=1
+  fi
+done
+
+if [[ ${verify_failed} -eq 1 ]]; then
+  echo "" >&2
+  echo "ERROR: at least one job is not running the image just built." >&2
+  echo "Re-run the deploy; if it persists, set the image explicitly:" >&2
+  echo "  gcloud run jobs update JOB --region=${REGION} --image=${IMAGE}" >&2
+  exit 1
+fi
+
 cat <<EOF
+
+Deployed image: ${IMAGE}
 
 Done. Trigger a crawl manually:
 

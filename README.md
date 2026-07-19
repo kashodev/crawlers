@@ -237,9 +237,16 @@ rather than one job that must survive for hours.
 ## Deploy
 
 ```bash
-./deploy.sh YOUR_PROJECT_ID [REGION]     # default region: northamerica-northeast2
+./deploy.sh YOUR_PROJECT_ID [REGION] [TASKS]   # default: northamerica-northeast2, 1 task
 gcloud run jobs execute crawler-toronto-bylaws --region=REGION
 ```
+
+**Images are tagged immutably**, by commit SHA (plus a timestamp when the tree
+is dirty), never `:latest` alone. A fixed tag makes the `--image` string
+identical on every deploy, so `gcloud run jobs update` sees no spec change,
+skips the update, and the job keeps executing the digest it first resolved — a
+stale rollout that still reports success. The deploy ends by asserting each job
+is running the image just built, and fails loudly if not.
 
 Creates Artifact Registry, two buckets, Firestore, a least-privilege service
 account, and one Cloud Run Job per site. Triggering is manual by design.
