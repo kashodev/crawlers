@@ -14,9 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY common/ ./common/
 COPY utils/ ./utils/
+COPY migrations/ ./migrations/
 COPY ontario_legislative_bills/ ./ontario_legislative_bills/
 COPY toronto_bylaws/ ./toronto_bylaws/
-COPY main.py .
+COPY firestore.indexes.json main.py ./
 
 # Non-root: Cloud Run doesn't require it, but there's no reason to run as root.
 RUN useradd --create-home --uid 1000 crawler \

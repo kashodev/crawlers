@@ -38,6 +38,22 @@ log = logging.getLogger(__name__)
 # The bylaw path itself is permitted; PoliteClient re-checks every URL anyway.
 DEFAULT_TEMPLATE = "https://www.toronto.ca/legdocs/bylaws/{year}/law{number:04d}.pdf"
 
+_KEY_RE = re.compile(r"^(\d{4})/law(\d+)\.pdf$")
+
+
+# Module-level so migrations and tooling can map keys to positions without
+# constructing a crawler (which would open an HTTP client and storage).
+def position_from_key(key: str) -> dict | None:
+    match = _KEY_RE.match(key or "")
+    if not match:
+        return None
+    return {"year": int(match.group(1)), "number": int(match.group(2))}
+
+
+def position_sort_key(position: dict) -> str:
+    # Zero-padded so string ordering matches numeric ordering.
+    return f"{int(position.get('year', 0)):04d}-{int(position.get('number', 0)):06d}"
+
 
 class TorontoBylawsCrawler(BaseCrawler):
     @property
@@ -170,14 +186,10 @@ class TorontoBylawsCrawler(BaseCrawler):
         return (int(position.get("year", 0)), int(position.get("number", 0)))
 
     def position_from_key(self, key: str) -> dict | None:
-        match = re.match(r"^(\d{4})/law(\d+)\.pdf$", key)
-        if not match:
-            return None
-        return {"year": int(match.group(1)), "number": int(match.group(2))}
+        return position_from_key(key)
 
     def position_sort_key(self, position: dict) -> str:
-        # Zero-padded so string ordering matches numeric ordering.
-        return f"{int(position.get('year', 0)):04d}-{int(position.get('number', 0)):06d}"
+        return position_sort_key(position)
 
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume

@@ -41,6 +41,18 @@ class MetadataRepository(ABC):
     def save_checkpoint(self, checkpoint_id: str, checkpoint: CheckpointRecord) -> None: ...
 
     @abstractmethod
+    def iter_documents(self, start_after: str | None = None, page_size: int = 500):
+        """Yield every document in id order, paginated.
+
+        Ordered by id so a migration can record the last id it handled and
+        resume from there instead of restarting.
+        """
+
+    @abstractmethod
+    def update_documents(self, updates: list[tuple[str, dict]]) -> None:
+        """Merge partial field updates into existing documents, in batches."""
+
+    @abstractmethod
     def latest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
         """Most recently downloaded documents, newest write first.
 
@@ -114,6 +126,24 @@ class LocalMetadataRepository(MetadataRepository):
         (self.checkpoints_dir / f"{checkpoint_id}.json").write_text(
             json.dumps(checkpoint.to_dict(), indent=2), encoding="utf-8"
         )
+
+    def iter_documents(self, start_after: str | None = None, page_size: int = 500):
+        for path in sorted(self.docs_dir.glob("*.json"), key=lambda p: p.stem):
+            if start_after and path.stem <= start_after:
+                continue
+            try:
+                yield json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                log.warning("Skipping corrupt document", extra={"path": str(path)})
+
+    def update_documents(self, updates: list[tuple[str, dict]]) -> None:
+        for doc_id, fields in updates:
+            path = self.docs_dir / f"{doc_id}.json"
+            if not path.exists():
+                continue
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.update(fields)
+            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
     def _downloaded(self, site: str) -> list[dict]:
         records = []
@@ -193,6 +223,32 @@ class FirestoreMetadataRepository(MetadataRepository):
 
     def save_checkpoint(self, checkpoint_id: str, checkpoint: CheckpointRecord) -> None:
         self._checkpoints.document(checkpoint_id).set(checkpoint.to_dict(), merge=True)
+
+    def iter_documents(self, start_after: str | None = None, page_size: int = 500):
+        from google.cloud import firestore
+
+        cursor = start_after
+        while True:
+            query = self._docs.order_by("__name__").limit(page_size)
+            if cursor:
+                query = query.start_after({"__name__": self._docs.document(cursor)})
+            page = list(query.stream())
+            if not page:
+                return
+            for snapshot in page:
+                record = snapshot.to_dict() or {}
+                record.setdefault("doc_id", snapshot.id)
+                yield record
+            cursor = page[-1].id
+            if len(page) < page_size:
+                return
+
+    def update_documents(self, updates: list[tuple[str, dict]]) -> None:
+        for start in range(0, len(updates), 500):
+            batch = self._client.batch()
+            for doc_id, fields in updates[start : start + 500]:
+                batch.set(self._docs.document(doc_id), fields, merge=True)
+            batch.commit()
 
     def _query_downloaded(self, site: str, order_field: str, limit: int) -> list[dict]:
         """One ordered, indexed query — no collection scan, no bucket listing."""

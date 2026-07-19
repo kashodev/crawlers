@@ -45,6 +45,31 @@ STAGE_CODES = {
 }
 
 
+_KEY_RE = re.compile(r"^parliament-(\d+)/session-(\d+)/bill-([\w-]+)/")
+
+
+# Module-level so migrations and tooling can map keys to positions without
+# constructing a crawler (which would open an HTTP client and storage).
+def position_from_key(key: str) -> dict | None:
+    match = _KEY_RE.match(key or "")
+    if not match:
+        return None
+    return {
+        "parliament": int(match.group(1)),
+        "session": int(match.group(2)),
+        "bill": match.group(3),
+    }
+
+
+def position_sort_key(position: dict) -> str:
+    number, suffix = _bill_rank(str(position.get("bill", "0")))
+    return (
+        f"{int(position.get('parliament', 0)):03d}"
+        f"-{int(position.get('session', 0)):03d}"
+        f"-{number:06d}{suffix}"
+    )
+
+
 def _bill_rank(number: str) -> tuple[int, str]:
     """Sortable rank for a bill number.
 
@@ -215,22 +240,10 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
         )
 
     def position_from_key(self, key: str) -> dict | None:
-        match = re.match(r"^parliament-(\d+)/session-(\d+)/bill-([\w-]+)/", key)
-        if not match:
-            return None
-        return {
-            "parliament": int(match.group(1)),
-            "session": int(match.group(2)),
-            "bill": match.group(3),
-        }
+        return position_from_key(key)
 
     def position_sort_key(self, position: dict) -> str:
-        number, suffix = _bill_rank(str(position.get("bill", "0")))
-        return (
-            f"{int(position.get('parliament', 0)):03d}"
-            f"-{int(position.get('session', 0)):03d}"
-            f"-{number:06d}{suffix}"
-        )
+        return position_sort_key(position)
 
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume

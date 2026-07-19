@@ -144,9 +144,50 @@ This replaces an earlier fallback that listed the whole bucket to find a
 position — with tens of thousands of objects that was slow enough to look like a
 hang. Listing is now always prefix-scoped and never on the startup path.
 
-These queries need composite indexes (`firestore.indexes.json`, deployed by
-`deploy.sh`). Without them Firestore returns `FailedPrecondition`; the crawler
-logs that explicitly and degrades rather than failing.
+These queries need composite indexes, applied by the migration runner (below).
+Without them Firestore returns `FailedPrecondition`; the crawler logs that
+explicitly and degrades rather than failing.
+
+## Migrations
+
+Schema and data changes live in `migrations/` and run as their own Cloud Run
+Job (`crawler-migrate`) **before** the crawler jobs are updated — `deploy.sh`
+gates the rollout on the migration exit code.
+
+```bash
+docker compose run --rm --entrypoint python crawler -m migrations.runner --status
+docker compose run --rm --entrypoint python crawler -m migrations.runner --apply --dry-run
+docker compose run --rm --entrypoint python crawler -m migrations.runner --apply
+```
+
+| Migration | Kind | What it does |
+|---|---|---|
+| `0001_composite_indexes` | declarative | Creates the resume indexes from `firestore.indexes.json` via the Firestore Admin API |
+| `0002_backfill_sort_key` | data | Populates `sort_key` on documents written before the field existed |
+
+Idempotency is layered, because any single mechanism can be defeated:
+
+1. A **ledger** (`_migrations` collection) records what ran, keyed by migration id.
+2. A **transactional claim** stops two concurrent deploys applying the same
+   migration; a claim older than 30 minutes is treated as abandoned and
+   retried.
+3. **Migrations are individually re-runnable** — index creation tolerates
+   `ALREADY_EXISTS`, the backfill skips documents that already have the field.
+   The ledger is then an optimisation and audit trail, not the only safeguard.
+
+A migration edited *after* being applied is reported as `DRIFTED` and neither
+re-run nor silently skipped — checksums are compared on every run. Data
+migrations checkpoint progress by document id, so a run killed partway resumes
+instead of restarting.
+
+**Index builds do not block the deploy.** They can take from minutes to over an
+hour, and the crawler already degrades gracefully while they build, so the
+runner warns at its timeout (`MIGRATION_INDEX_TIMEOUT`, default 600s) and
+continues. Check state with `gcloud firestore indexes composite list`.
+
+Migrations run as a **separate service account** (`pdf-crawler-migrate`) with
+`roles/datastore.owner`, since index administration needs rights the crawler
+itself should not have.
 
 ```bash
 docker compose run --rm crawler --site toronto_bylaws --show-checkpoint

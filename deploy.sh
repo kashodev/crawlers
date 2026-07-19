@@ -22,6 +22,11 @@ PDF_BUCKET="${PROJECT}-pdf-archive"
 CONFIG_BUCKET="${PROJECT}-crawler-config"
 SA="pdf-crawler"
 SA_EMAIL="${SA}@${PROJECT}.iam.gserviceaccount.com"
+# Migrations create indexes, which the crawler's own account must not be able
+# to do — so they run as a separate identity with a broader Firestore role.
+MIGRATE_SA="pdf-crawler-migrate"
+MIGRATE_SA_EMAIL="${MIGRATE_SA}@${PROJECT}.iam.gserviceaccount.com"
+MIGRATE_JOB="crawler-migrate"
 
 echo "==> Project ${PROJECT} / region ${REGION}"
 gcloud config set project "${PROJECT}" >/dev/null
@@ -51,15 +56,6 @@ done
 echo "==> Firestore (Native mode)"
 gcloud firestore databases describe --database="(default)" >/dev/null 2>&1 || \
   gcloud firestore databases create --location="${REGION}" --type=firestore-native
-
-echo "==> Firestore composite indexes (required for fast resume)"
-# Index builds are asynchronous and can take minutes on a populated collection.
-# The crawler degrades to a slower resume path until they are READY, so this is
-# safe to fire and forget — but resume stays slow until it finishes.
-if ! gcloud firestore indexes create --index-file=firestore.indexes.json --quiet 2>/dev/null; then
-  echo "    NOTE: index creation reported an error (usually 'already exists')."
-  echo "    Check state with: gcloud firestore indexes composite list"
-fi
 
 echo "==> Service account (least privilege: these two resources only)"
 gcloud iam service-accounts describe "${SA_EMAIL}" >/dev/null 2>&1 || \
@@ -106,6 +102,21 @@ bind_with_retry "datastore.user on ${PROJECT}" \
   gcloud projects add-iam-policy-binding "${PROJECT}" \
     --member="serviceAccount:${SA_EMAIL}" --role=roles/datastore.user
 
+echo "==> Migration service account"
+gcloud iam service-accounts describe "${MIGRATE_SA_EMAIL}" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create "${MIGRATE_SA}" --display-name="PDF crawler migrations"
+
+for attempt in $(seq 1 30); do
+  gcloud iam service-accounts describe "${MIGRATE_SA_EMAIL}" >/dev/null 2>&1 && break
+  [[ ${attempt} -eq 30 ]] && { echo "ERROR: ${MIGRATE_SA_EMAIL} not visible" >&2; exit 1; }
+  sleep 2
+done
+
+# datastore.owner covers index administration, which datastore.user does not.
+bind_with_retry "datastore.owner on ${PROJECT}" \
+  gcloud projects add-iam-policy-binding "${PROJECT}" \
+    --member="serviceAccount:${MIGRATE_SA_EMAIL}" --role=roles/datastore.owner
+
 echo "==> Uploading site configs"
 for site in ontario_legislative_bills toronto_bylaws; do
   gcloud storage cp "${site}/config.yaml" "gs://${CONFIG_BUCKET}/sites/${site}.yaml"
@@ -115,6 +126,39 @@ echo "==> Building and pushing image (linux/amd64 for Cloud Run)"
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet >/dev/null
 docker build --platform linux/amd64 -t "${IMAGE}" .
 docker push "${IMAGE}"
+
+echo "==> Migration job"
+# Same image, different entrypoint. Runs in-cluster as the migration service
+# account, so nobody needs Firestore admin rights locally to deploy.
+migrate_args=(
+  --image="${IMAGE}"
+  --region="${REGION}"
+  --service-account="${MIGRATE_SA_EMAIL}"
+  --cpu=1 --memory=512Mi
+  --max-retries=1
+  --task-timeout=1800
+  --tasks=1
+  --command="python"
+  --args="-m,migrations.runner,--apply"
+  --set-env-vars="FIRESTORE_PROJECT=${PROJECT},MIGRATION_INDEX_TIMEOUT=600"
+)
+
+if gcloud run jobs describe "${MIGRATE_JOB}" --region="${REGION}" >/dev/null 2>&1; then
+  gcloud run jobs update "${MIGRATE_JOB}" "${migrate_args[@]}"
+else
+  gcloud run jobs create "${MIGRATE_JOB}" "${migrate_args[@]}"
+fi
+
+echo "==> Running migrations (indexes + data backfills) before the crawlers"
+# Gate the crawler rollout on this: a failed data migration means the new code
+# would run against a schema it does not expect.
+if ! gcloud run jobs execute "${MIGRATE_JOB}" --region="${REGION}" --wait; then
+  echo "" >&2
+  echo "ERROR: migrations failed — crawler jobs were NOT updated." >&2
+  echo "Inspect with:" >&2
+  echo "  gcloud beta run jobs logs tail ${MIGRATE_JOB} --region=${REGION}" >&2
+  exit 1
+fi
 
 # One job per site: they have different runtimes and politeness budgets, and
 # separate jobs keep their logs, retries, and failures independently visible.
