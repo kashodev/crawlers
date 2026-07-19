@@ -6,12 +6,16 @@
 # Idempotent: re-running updates the job rather than failing on existing
 # resources. Requires gcloud, docker, and an authenticated account.
 #
-#   ./deploy.sh PROJECT_ID [REGION]
+#   ./deploy.sh PROJECT_ID [REGION] [TASKS]
 
 set -euo pipefail
 
-PROJECT="${1:?usage: ./deploy.sh PROJECT_ID [REGION]}"
+PROJECT="${1:?usage: ./deploy.sh PROJECT_ID [REGION] [TASKS]}"
 REGION="${2:-northamerica-northeast2}"   # Toronto region: closest to the sources
+# Parallel tasks per job. Each task runs its own rate limiter, so N tasks means
+# N times the request rate at the origin — this is a politeness decision, not
+# just a throughput one. 1 for routine runs; 2-4 is reasonable for a backfill.
+TASKS="${3:-1}"
 REPO="crawler-repo"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/crawler:latest"
 PDF_BUCKET="${PROJECT}-pdf-archive"
@@ -47,6 +51,15 @@ done
 echo "==> Firestore (Native mode)"
 gcloud firestore databases describe --database="(default)" >/dev/null 2>&1 || \
   gcloud firestore databases create --location="${REGION}" --type=firestore-native
+
+echo "==> Firestore composite indexes (required for fast resume)"
+# Index builds are asynchronous and can take minutes on a populated collection.
+# The crawler degrades to a slower resume path until they are READY, so this is
+# safe to fire and forget — but resume stays slow until it finishes.
+if ! gcloud firestore indexes create --index-file=firestore.indexes.json --quiet 2>/dev/null; then
+  echo "    NOTE: index creation reported an error (usually 'already exists')."
+  echo "    Check state with: gcloud firestore indexes composite list"
+fi
 
 echo "==> Service account (least privilege: these two resources only)"
 gcloud iam service-accounts describe "${SA_EMAIL}" >/dev/null 2>&1 || \
@@ -120,7 +133,7 @@ for site in ontario_legislative_bills toronto_bylaws; do
     --cpu=1 --memory=1Gi
     --max-retries=2
     --task-timeout=3600
-    --tasks=1
+    --tasks="${TASKS}"
     --set-env-vars="CRAWL_SITE=${site},PDF_BUCKET=${PDF_BUCKET},PDF_PREFIX=${site},FIRESTORE_PROJECT=${PROJECT},CONFIG_URI=gs://${CONFIG_BUCKET}/sites/${site}.yaml"
   )
 

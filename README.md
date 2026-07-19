@@ -122,10 +122,31 @@ Every run does the same two things, in this order:
 2. **Check for new documents** above the frontier — only the current year
    (Toronto) or newest session (Ontario) can gain them, so this is cheap.
 
-Resume position is recovered in preference order: the checkpoint (one read),
-then by listing stored objects in GCS and parsing the highest key, then a fresh
-crawl. The middle path means a lost or never-written checkpoint still doesn't
-force a full re-crawl.
+**Firestore is the source of truth, and is consulted on every start** — whether
+or not a checkpoint exists. Two ordered, indexed queries resolve the position in
+milliseconds:
+
+- `latest_downloaded` — the most recently *written* document. In a descending
+  sweep that is the furthest the crawl got, so it becomes the **cursor**.
+- `highest_downloaded` — the highest `sort_key`, which becomes the **frontier**.
+
+Each result is then **cross-checked against Cloud Storage**, scoped to that
+document's own prefix. A metadata row whose object is missing is skipped and the
+next candidate tried, so one stale row can't misdirect the crawl. The resolved
+position is written back, so a checkpoint is recreated retroactively even if it
+was lost, and a run that dies before its first download still leaves one behind.
+
+The stored checkpoint is still read, but only to supply `sweep_complete` and to
+advance the cursor past stretches the sweep probed without finding anything
+(lower is further along in a descending sweep).
+
+This replaces an earlier fallback that listed the whole bucket to find a
+position — with tens of thousands of objects that was slow enough to look like a
+hang. Listing is now always prefix-scoped and never on the startup path.
+
+These queries need composite indexes (`firestore.indexes.json`, deployed by
+`deploy.sh`). Without them Firestore returns `FailedPrecondition`; the crawler
+logs that explicitly and degrades rather than failing.
 
 ```bash
 docker compose run --rm crawler --site toronto_bylaws --show-checkpoint
@@ -152,9 +173,28 @@ gcloud run jobs execute crawler-toronto-bylaws --region=REGION
 Creates Artifact Registry, two buckets, Firestore, a least-privilege service
 account, and one Cloud Run Job per site. Triggering is manual by design.
 
-Scaling a large crawl across tasks: raise `--tasks` on the job. Tasks shard on
-year (Toronto) and bill (Ontario) via `CLOUD_RUN_TASK_INDEX`, so they cover
-disjoint work without coordination.
+## Parallelism
+
+```bash
+./deploy.sh PROJECT_ID REGION 4     # 4 tasks per job
+```
+
+Tasks shard on **year** (Toronto) and **session** (Ontario) via
+`CLOUD_RUN_TASK_INDEX`, covering disjoint work with no coordination. Ontario
+shards at session rather than bill level because the session page must be
+fetched to learn its bills at all — finer sharding would make every task
+re-fetch every listing page.
+
+Sharding uses a blake2b digest, not the builtin `hash()`, which Python salts per
+process: with `hash()` each task computed a *different* map, so work was both
+duplicated and silently dropped. Each shard also keeps its own checkpoint
+(`{site}--t{i}of{n}`) so tasks never overwrite each other's position.
+
+**Parallelism is a politeness decision, not just a throughput one.** Each task
+runs its own rate limiter, so N tasks means N× the request rate at a single
+government host. Measured: network time is only ~10-20% of the pacing interval,
+so in-process concurrency would buy almost nothing — the speedup comes entirely
+from the added request rate. 2-4 tasks for a backfill, 1 for routine runs.
 
 Cost is dominated by storage retention, not compute — idle cost is the bucket
 alone. `lifecycle.json` transitions PDFs to Nearline at 30 days and Coldline at

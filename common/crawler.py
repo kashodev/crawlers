@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from common.metadata import MetadataRepository, build_repository
 from common.models import CheckpointRecord, DocState, DocumentRecord, JobRecord, JobStatus
 from common.storage import Storage, build_storage
 from utils.hashing import doc_id as make_doc_id
-from utils.hashing import sha256_bytes
+from utils.hashing import sha256_bytes, shard_index
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +110,14 @@ class BaseCrawler(ABC):
             sweep_complete=self.resume.sweep_complete,
             last_job_id=self.job.job_id,
             last_status=JobStatus.RUNNING.value,
+            task_index=self.task_index,
+            task_count=self.task_count,
+            derived_from=self.resume.source,
         )
+        # Write the rebuilt position straight back, so a run that dies before
+        # its first download still leaves a usable checkpoint behind.
+        if self.resume.source not in ("none", ""):
+            self.save_checkpoint()
 
     # --- to implement in site modules ------------------------------------
 
@@ -133,76 +141,164 @@ class BaseCrawler(ABC):
         """Recover a position from a storage key, for checkpoint-less recovery."""
         return None
 
+    def position_sort_key(self, position: dict[str, Any]) -> str | None:
+        """Lexicographically sortable form of a position, stored on documents.
+
+        Must sort identically to `position_rank`, since Firestore orders on the
+        string while the crawler compares ranks in memory.
+        """
+        return None
+
     # --- resume -----------------------------------------------------------
 
-    def load_resume_state(self) -> ResumeState:
-        """Determine where to resume.
+    @property
+    def checkpoint_id(self) -> str:
+        """Checkpoint document id.
 
-        Preference order:
-          1. the site's checkpoint document — one read, always current;
-          2. failing that, the stored objects themselves — slower, but it
-             recovers even if the checkpoint was lost or never written;
-          3. failing that, a fresh crawl from the top of the range.
+        Parallel tasks each own a disjoint shard and so keep separate
+        checkpoints; a single-task job keeps the plain site-named document.
+        """
+        if self.task_count <= 1:
+            return self.config.name
+        return f"{self.config.name}--t{self.task_index}of{self.task_count}"
+
+    def load_resume_state(self) -> ResumeState:
+        """Determine where to resume, on every start.
+
+        Firestore is always consulted first and is treated as the source of
+        truth for what actually landed: two ordered, indexed queries return the
+        last-written document (the cursor, since the sweep descends) and the
+        highest-ranked one (the frontier). Each is then cross-checked against
+        storage, scoped to that document's own prefix, so a metadata row whose
+        object is missing does not send the crawl to the wrong place.
+
+        The checkpoint is still read, but only to contribute `sweep_complete`
+        and to advance the cursor past stretches the sweep probed without
+        finding anything. That means a lost or stale checkpoint costs nothing:
+        the position is rebuilt from Firestore and written back.
         """
         if os.environ.get("CRAWLER_NO_RESUME") == "1":
             log.info("Resume disabled; starting from the top of the range")
             return ResumeState()
 
-        checkpoint = self.repo.get_checkpoint(self.config.name)
-        if checkpoint and (checkpoint.get("cursor") or checkpoint.get("frontier")):
-            state = ResumeState(
-                cursor=checkpoint.get("cursor"),
-                frontier=checkpoint.get("frontier"),
-                sweep_complete=bool(checkpoint.get("sweep_complete")),
-                source="checkpoint",
-                last_status=checkpoint.get("last_status"),
-            )
+        started = time.monotonic()
+        checkpoint = self.repo.get_checkpoint(self.checkpoint_id) or {}
+        cursor = self._verified_position(self.repo.latest_downloaded(self.config.name), "cursor")
+        frontier = self._verified_position(
+            self.repo.highest_downloaded(self.config.name), "frontier"
+        )
+
+        sources: list[str] = []
+        if cursor or frontier:
+            sources.append("firestore")
+
+        # The checkpoint may sit below the last download because the sweep kept
+        # probing through a gap. Lower is further along in a descending sweep,
+        # so prefer it and avoid re-probing ground already covered.
+        checkpoint_cursor = checkpoint.get("cursor")
+        if checkpoint_cursor and (
+            cursor is None
+            or self.position_rank(checkpoint_cursor) < self.position_rank(cursor)
+        ):
+            cursor = checkpoint_cursor
+            sources.append("checkpoint")
+
+        checkpoint_frontier = checkpoint.get("frontier")
+        if checkpoint_frontier and (
+            frontier is None
+            or self.position_rank(checkpoint_frontier) > self.position_rank(frontier)
+        ):
+            frontier = checkpoint_frontier
+            if "checkpoint" not in sources:
+                sources.append("checkpoint")
+
+        elapsed = time.monotonic() - started
+
+        if cursor is None and frontier is None:
             log.info(
-                "Loaded checkpoint",
-                extra={
-                    "site": self.config.name,
-                    "cursor": state.cursor,
-                    "frontier": state.frontier,
-                    "sweepComplete": state.sweep_complete,
-                    "lastStatus": state.last_status,
-                },
+                "No prior state; starting a fresh crawl",
+                extra={"site": self.config.name, "lookupSeconds": round(elapsed, 3)},
             )
-            return state
+            return ResumeState()
 
-        recovered = self._recover_from_storage()
-        if recovered is not None:
+        state = ResumeState(
+            cursor=cursor,
+            frontier=frontier,
+            sweep_complete=bool(checkpoint.get("sweep_complete")),
+            source="+".join(sources) or "none",
+            last_status=checkpoint.get("last_status"),
+        )
+        log.info(
+            "Resolved resume position",
+            extra={
+                "site": self.config.name,
+                "checkpointId": self.checkpoint_id,
+                "cursor": state.cursor,
+                "frontier": state.frontier,
+                "sweepComplete": state.sweep_complete,
+                "source": state.source,
+                "hadCheckpoint": bool(checkpoint),
+                "lookupSeconds": round(elapsed, 3),
+            },
+        )
+        return state
+
+    def _verified_position(self, records: list[dict], label: str) -> dict[str, Any] | None:
+        """First record from Firestore whose object is really in storage.
+
+        Metadata can outlive its object — a deleted bucket, a partial restore, a
+        write that landed before an upload failed. Walking a few candidates
+        rather than trusting the first keeps one stale row from rewinding or
+        over-advancing the resume position.
+        """
+        for record in records:
+            key = record.get("storage_key")
+            position = None
+            if key:
+                position = self.position_from_key(key)
+            if position is None:
+                continue
+            try:
+                if not self.storage.exists(key):
+                    log.warning(
+                        "Metadata references a missing object; trying the next candidate",
+                        extra={"label": label, "storageKey": key},
+                    )
+                    continue
+            except Exception as exc:
+                # Storage unreachable: trust metadata rather than lose the run.
+                log.warning(
+                    "Could not verify object in storage; trusting metadata",
+                    extra={"label": label, "storageKey": key, "error": str(exc)},
+                )
+            return position
+
+        if records:
             log.warning(
-                "No checkpoint; recovered position from stored objects",
-                extra={"site": self.config.name, "frontier": recovered},
+                "No Firestore candidate could be confirmed in storage",
+                extra={"label": label, "candidates": len(records)},
             )
-            # Only the frontier is recoverable this way: storage shows what was
-            # downloaded, not how far the sweep probed past it. Treating that
-            # as the cursor too means the sweep re-probes the gap below it,
-            # which is correct, just not free.
-            return ResumeState(cursor=recovered, frontier=recovered, source="storage")
+        return None
 
-        log.info("No prior state; starting a fresh crawl", extra={"site": self.config.name})
-        return ResumeState()
+    def recover_from_storage(self, sub_prefix: str = "") -> dict[str, Any] | None:
+        """Highest position in storage under `sub_prefix`.
 
-    def _recover_from_storage(self) -> dict[str, Any] | None:
-        """Highest position present in storage, by listing stored objects."""
+        A last resort for callers that know which slice to look in; unscoped
+        use walks the whole bucket and should be avoided.
+        """
         best: dict[str, Any] | None = None
         best_rank: tuple = ()
-        count = 0
         try:
-            for key in self.storage.list_keys():
+            for key in self.storage.list_keys(sub_prefix):
                 position = self.position_from_key(key)
                 if position is None:
                     continue
-                count += 1
                 rank = self.position_rank(position)
                 if not best_rank or rank > best_rank:
                     best, best_rank = position, rank
         except Exception as exc:
-            log.warning("Could not list storage for recovery", extra={"error": str(exc)})
+            log.warning("Could not list storage", extra={"error": str(exc)})
             return None
-        if count:
-            log.info("Scanned stored objects for recovery", extra={"objects": count})
         return best
 
     def note_progress(self, candidate: PdfCandidate) -> None:
@@ -235,7 +331,7 @@ class BaseCrawler(ABC):
         self._checkpoint.last_status = status or JobStatus.RUNNING.value
         self._checkpoint.updated_at = datetime.now(timezone.utc).isoformat()
         try:
-            self.repo.save_checkpoint(self._checkpoint)
+            self.repo.save_checkpoint(self.checkpoint_id, self._checkpoint)
             self._since_checkpoint = 0
         except Exception as exc:
             # A checkpoint failure must not kill a working crawl; worst case we
@@ -281,12 +377,13 @@ class BaseCrawler(ABC):
     def owns(self, shard_key: str | int) -> bool:
         """Whether this task shard handles `shard_key`.
 
-        Discovery runs in every task, but each one downloads a disjoint slice.
-        Keeps parallel tasks from duplicating work or racing on the same object.
+        Called once per work unit, during discovery only. Sharding a second
+        time downstream would multiply the filters and drop most of the work,
+        so `process()` deliberately does not re-check ownership.
         """
         if self.task_count <= 1:
             return True
-        return hash(str(shard_key)) % self.task_count == self.task_index
+        return shard_index(shard_key, self.task_count) == self.task_index
 
     def record_miss(self) -> None:
         """Note a probe that yielded no PDF, and stop the crawl if the streak is long enough."""
@@ -321,20 +418,19 @@ class BaseCrawler(ABC):
         """Download and store one candidate. Returns the resulting DocState."""
         doc_id = make_doc_id(candidate.url)
 
-        if not self.owns(candidate.storage_key):
-            return "NOT_OWNED"
-
         if self._should_skip(doc_id, candidate):
             log.debug("Already downloaded; skipping", extra={"url": candidate.url})
             self.job.skipped += 1
             return DocState.SKIPPED.value
 
         existing = self.repo.get_document(doc_id) or {}
+        position = self.position_of(candidate)
         record = DocumentRecord(
             doc_id=doc_id,
             site=self.config.name,
             source_url=candidate.url,
             referrer_url=candidate.referrer_url,
+            sort_key=self.position_sort_key(position) if position else None,
             first_seen_at=existing.get("first_seen_at") or datetime.now(timezone.utc).isoformat(),
             attempts=int(existing.get("attempts") or 0) + 1,
             last_job_id=self.job.job_id,

@@ -5,6 +5,8 @@ automatically, so the same logger works locally (plain text) and on Cloud Run
 (structured) with no call-site changes.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

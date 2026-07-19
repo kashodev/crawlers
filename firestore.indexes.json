@@ -1,0 +1,26 @@
+{
+  "//": "Composite indexes for the resume queries in common/metadata.py. Without these, Firestore rejects the ordered queries with FailedPrecondition and resume falls back to a slow path. Deploy with: gcloud firestore indexes create --index-file=firestore.indexes.json (or `firebase deploy --only firestore:indexes`).",
+  "indexes": [
+    {
+      "//": "latest_downloaded(): last document written = how far the descending sweep got = the resume cursor.",
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "site", "order": "ASCENDING" },
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "downloaded_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "//": "highest_downloaded(): highest-ranked document = the frontier that new material appears above.",
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "site", "order": "ASCENDING" },
+        { "fieldPath": "state", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

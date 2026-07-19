@@ -35,10 +35,22 @@ class MetadataRepository(ABC):
     def save_job(self, job: JobRecord) -> None: ...
 
     @abstractmethod
-    def get_checkpoint(self, site: str) -> dict | None: ...
+    def get_checkpoint(self, checkpoint_id: str) -> dict | None: ...
 
     @abstractmethod
-    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None: ...
+    def save_checkpoint(self, checkpoint_id: str, checkpoint: CheckpointRecord) -> None: ...
+
+    @abstractmethod
+    def latest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        """Most recently downloaded documents, newest write first.
+
+        In a descending sweep the last write is the furthest the crawl got, so
+        this is the resume cursor.
+        """
+
+    @abstractmethod
+    def highest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        """Downloaded documents with the highest sort_key — the frontier."""
 
     def close(self) -> None:
         self.flush()
@@ -88,20 +100,41 @@ class LocalMetadataRepository(MetadataRepository):
             json.dumps(job.to_dict(), indent=2), encoding="utf-8"
         )
 
-    def get_checkpoint(self, site: str) -> dict | None:
-        path = self.checkpoints_dir / f"{site}.json"
+    def get_checkpoint(self, checkpoint_id: str) -> dict | None:
+        path = self.checkpoints_dir / f"{checkpoint_id}.json"
         if not path.exists():
             return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            log.warning("Corrupt checkpoint; ignoring", extra={"site": site})
+            log.warning("Corrupt checkpoint; ignoring", extra={"checkpointId": checkpoint_id})
             return None
 
-    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None:
-        (self.checkpoints_dir / f"{checkpoint.site}.json").write_text(
+    def save_checkpoint(self, checkpoint_id: str, checkpoint: CheckpointRecord) -> None:
+        (self.checkpoints_dir / f"{checkpoint_id}.json").write_text(
             json.dumps(checkpoint.to_dict(), indent=2), encoding="utf-8"
         )
+
+    def _downloaded(self, site: str) -> list[dict]:
+        records = []
+        for path in self.docs_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if record.get("site") == site and record.get("state") == "DOWNLOADED":
+                records.append(record)
+        return records
+
+    def latest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        records = self._downloaded(site)
+        records.sort(key=lambda r: r.get("downloaded_at") or "", reverse=True)
+        return records[:limit]
+
+    def highest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        records = self._downloaded(site)
+        records.sort(key=lambda r: r.get("sort_key") or "", reverse=True)
+        return records[:limit]
 
 
 class FirestoreMetadataRepository(MetadataRepository):
@@ -154,12 +187,47 @@ class FirestoreMetadataRepository(MetadataRepository):
     def save_job(self, job: JobRecord) -> None:
         self._jobs.document(job.job_id).set(job.to_dict(), merge=True)
 
-    def get_checkpoint(self, site: str) -> dict | None:
-        snapshot = self._checkpoints.document(site).get()
+    def get_checkpoint(self, checkpoint_id: str) -> dict | None:
+        snapshot = self._checkpoints.document(checkpoint_id).get()
         return snapshot.to_dict() if snapshot.exists else None
 
-    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None:
-        self._checkpoints.document(checkpoint.site).set(checkpoint.to_dict(), merge=True)
+    def save_checkpoint(self, checkpoint_id: str, checkpoint: CheckpointRecord) -> None:
+        self._checkpoints.document(checkpoint_id).set(checkpoint.to_dict(), merge=True)
+
+    def _query_downloaded(self, site: str, order_field: str, limit: int) -> list[dict]:
+        """One ordered, indexed query — no collection scan, no bucket listing."""
+        from google.api_core import exceptions as gexc
+        from google.cloud import firestore
+
+        try:
+            query = (
+                self._docs.where(filter=firestore.FieldFilter("site", "==", site))
+                .where(filter=firestore.FieldFilter("state", "==", "DOWNLOADED"))
+                .order_by(order_field, direction=firestore.Query.DESCENDING)
+                .limit(limit)
+            )
+            return [doc.to_dict() for doc in query.stream()]
+        except gexc.FailedPrecondition as exc:
+            # Almost always a missing composite index. Say so explicitly —
+            # the caller falls back to a slower path, which is easy to mistake
+            # for the fast one working badly.
+            log.error(
+                "Firestore rejected the resume query; deploy the composite "
+                "indexes (firestore.indexes.json) to enable fast resume",
+                extra={"orderField": order_field, "error": str(exc)},
+            )
+            return []
+        except Exception as exc:
+            log.warning(
+                "Resume query failed", extra={"orderField": order_field, "error": str(exc)}
+            )
+            return []
+
+    def latest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        return self._query_downloaded(site, "downloaded_at", limit)
+
+    def highest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
+        return self._query_downloaded(site, "sort_key", limit)
 
 
 def build_repository(cfg: MetadataConfig) -> MetadataRepository:

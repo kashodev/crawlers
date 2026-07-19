@@ -38,6 +38,10 @@ class DocumentRecord:
     # Page the PDF link was found on — the provenance trail for RAG citations.
     referrer_url: str | None = None
     state: str = DocState.DISCOVERED.value
+    # Lexicographically sortable position, e.g. "2026-000713". Indexed so
+    # resume can find the newest/last document with a single ordered query
+    # instead of listing storage.
+    sort_key: str | None = None
     storage_uri: str | None = None
     storage_key: str | None = None
     content_hash: str | None = None
@@ -80,6 +84,12 @@ class CheckpointRecord:
     last_job_id: str | None = None
     last_status: str | None = None
     updated_at: str = field(default_factory=_now)
+    # Parallel tasks each own a shard and keep their own checkpoint, so they
+    # never overwrite one another's position.
+    task_index: int = 0
+    task_count: int = 1
+    # How this checkpoint was last derived, for debugging a bad resume.
+    derived_from: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

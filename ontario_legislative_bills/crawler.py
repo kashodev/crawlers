@@ -224,6 +224,14 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
             "bill": match.group(3),
         }
 
+    def position_sort_key(self, position: dict) -> str:
+        number, suffix = _bill_rank(str(position.get("bill", "0")))
+        return (
+            f"{int(position.get('parliament', 0)):03d}"
+            f"-{int(position.get('session', 0)):03d}"
+            f"-{number:06d}{suffix}"
+        )
+
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume
         sessions = self.find_sessions()
@@ -251,6 +259,14 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
             if resume_rank and (parliament, session) > (resume_rank[0], resume_rank[1]):
                 continue
 
+            # Shard on the session, not the bill: the session page must be
+            # fetched to learn its bills at all, so sharding any finer would
+            # make every task re-fetch every listing page — N times the load on
+            # ola.org for no extra throughput.
+            if not self.owns(f"{parliament}-{session}"):
+                log.debug("Session not owned by this task", extra={"url": session_url})
+                continue
+
             bills = self.find_bills(session_url)
             if not bills:
                 # An empty session page is a structural miss worth counting.
@@ -276,6 +292,11 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
             return
 
         parliament, session, session_url = sessions[0]
+        # New bills only appear in the newest session, so only the task that
+        # owns it does this pass.
+        if not self.owns(f"{parliament}-{session}"):
+            return
+
         frontier_rank = self.position_rank(frontier)
         log.info("Checking for new bills", extra={"session": session_url, "frontier": frontier})
 
@@ -292,10 +313,8 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
     def _bill_candidates(
         self, parliament: int, session: int, number: str, title: str, bill_url: str
     ) -> Iterator[PdfCandidate]:
-        # Shard on the bill so all of one bill's PDFs land in one task.
-        if not self.owns(f"{parliament}-{session}-{number}"):
-            return
-
+        # Ownership was already decided at the session level; re-checking here
+        # would filter the same work twice and drop most of it.
         pdfs = self.find_bill_pdfs(bill_url, parliament, session, number, title)
         if not pdfs:
             self.record_miss()

@@ -175,6 +175,10 @@ class TorontoBylawsCrawler(BaseCrawler):
             return None
         return {"year": int(match.group(1)), "number": int(match.group(2))}
 
+    def position_sort_key(self, position: dict) -> str:
+        # Zero-padded so string ordering matches numeric ordering.
+        return f"{int(position.get('year', 0)):04d}-{int(position.get('number', 0)):06d}"
+
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume
 

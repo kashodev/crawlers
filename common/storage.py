@@ -30,11 +30,12 @@ class Storage(ABC):
     def uri(self, key: str) -> str: ...
 
     @abstractmethod
-    def list_keys(self) -> Iterator[str]:
-        """Yield every stored key, relative to the configured prefix.
+    def list_keys(self, sub_prefix: str = "") -> Iterator[str]:
+        """Yield stored keys under `sub_prefix`, relative to the configured prefix.
 
-        Used only to rebuild a resume position when the checkpoint is missing,
-        so the cost of a full listing is acceptable there.
+        Always pass a sub_prefix when one is known (a year, a session): an
+        unscoped listing walks every object in the bucket, which is tens of
+        thousands of round trips once a backfill has run.
         """
 
 
@@ -70,11 +71,14 @@ class LocalStorage(Storage):
     def uri(self, key: str) -> str:
         return str(self._path(key))
 
-    def list_keys(self) -> Iterator[str]:
+    def list_keys(self, sub_prefix: str = "") -> Iterator[str]:
         root = self._path("")
         if not root.exists():
             return
-        for path in root.rglob("*"):
+        base = (root / sub_prefix) if sub_prefix else root
+        if not base.exists():
+            return
+        for path in base.rglob("*"):
             if path.is_file() and not path.name.endswith(".part"):
                 yield str(path.relative_to(root))
 
@@ -103,9 +107,10 @@ class GCSStorage(Storage):
     def uri(self, key: str) -> str:
         return f"gs://{self.bucket_name}/{self._key(key)}"
 
-    def list_keys(self) -> Iterator[str]:
+    def list_keys(self, sub_prefix: str = "") -> Iterator[str]:
         offset = len(self.prefix) + 1 if self.prefix else 0
-        for blob in self._client.list_blobs(self._bucket, prefix=self.prefix or None):
+        full_prefix = self._key(sub_prefix) if sub_prefix else (self.prefix or None)
+        for blob in self._client.list_blobs(self._bucket, prefix=full_prefix):
             yield blob.name[offset:]
 
 
