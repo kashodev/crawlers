@@ -191,6 +191,11 @@ class TorontoBylawsCrawler(BaseCrawler):
     def position_sort_key(self, position: dict) -> str:
         return position_sort_key(position)
 
+    def shard_key_of(self, position: dict) -> int | None:
+        # Discovery shards on the year; ownership must be decided the same way.
+        year = position.get("year")
+        return int(year) if year is not None else None
+
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume
 

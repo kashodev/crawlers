@@ -268,6 +268,18 @@ process: with `hash()` each task computed a *different* map, so work was both
 duplicated and silently dropped. Each shard also keeps its own checkpoint
 (`{site}--t{i}of{n}`) so tasks never overwrite each other's position.
 
+**Resume is shard-aware.** The cursor records how far *this shard's* descending
+sweep got, so it may only come from work this shard owns. The site-wide "last
+downloaded" query would otherwise return whichever shard wrote most recently,
+and since the sweep descends from the cursor, any shard whose years sit above
+it would skip them entirely — silently, while reporting success. Candidates are
+therefore filtered by `shard_key_of()`, and a checkpoint cursor from outside the
+shard's range (written by an older build, or left over from a different task
+count) is discarded with a warning rather than trusted. A shard that finds no
+position of its own sweeps its range from the top: it re-probes, but never
+skips. The frontier stays site-wide, since only the shard owning the newest
+year runs the new-documents pass.
+
 **Parallelism is a politeness decision, not just a throughput one.** Each task
 runs its own rate limiter, so N tasks means N× the request rate at a single
 government host. Measured: network time is only ~10-20% of the pacing interval,

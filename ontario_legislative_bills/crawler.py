@@ -245,6 +245,13 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
     def position_sort_key(self, position: dict) -> str:
         return position_sort_key(position)
 
+    def shard_key_of(self, position: dict) -> str | None:
+        # Discovery shards on the session; ownership must match.
+        parliament, session = position.get("parliament"), position.get("session")
+        if parliament is None or session is None:
+            return None
+        return f"{parliament}-{session}"
+
     def discover(self) -> Iterator[PdfCandidate]:
         state = self.resume
         sessions = self.find_sessions()

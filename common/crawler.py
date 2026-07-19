@@ -148,6 +148,15 @@ class BaseCrawler(ABC):
         """Recover a position from a storage key, for checkpoint-less recovery."""
         return None
 
+    def shard_key_of(self, position: dict[str, Any]) -> str | int | None:
+        """Shard key for a position — the same value discovery passes to owns().
+
+        Lets resume tell which shard a stored document belongs to. Returning
+        None means ownership can't be determined, and a sharded run then
+        declines to trust any position derived from stored data.
+        """
+        return None
+
     def position_sort_key(self, position: dict[str, Any]) -> str | None:
         """Lexicographically sortable form of a position, stored on documents.
 
@@ -190,7 +199,22 @@ class BaseCrawler(ABC):
 
         started = time.monotonic()
         checkpoint = self.repo.get_checkpoint(self.checkpoint_id) or {}
-        cursor = self._verified_position(self.repo.latest_downloaded(self.config.name), "cursor")
+
+        # The cursor says how far *this shard's* descending sweep got, so it
+        # must come from work this shard owns. The site-wide last write may
+        # belong to another shard and sit far below our own progress; adopting
+        # it would start the sweep beneath years we own and skip them silently.
+        # Ask for more candidates when sharded, since the most recent writes
+        # are likely to be other shards'.
+        sharded = self.task_count > 1
+        cursor = self._verified_position(
+            self.repo.latest_downloaded(self.config.name, limit=50 if sharded else 5),
+            "cursor",
+            owned_only=sharded,
+        )
+        # The frontier is deliberately site-wide: it marks the newest document
+        # anywhere, and only the shard owning the newest year runs the
+        # new-documents pass, so there is nothing to skip.
         frontier = self._verified_position(
             self.repo.highest_downloaded(self.config.name), "frontier"
         )
@@ -203,6 +227,26 @@ class BaseCrawler(ABC):
         # probing through a gap. Lower is further along in a descending sweep,
         # so prefer it and avoid re-probing ground already covered.
         checkpoint_cursor = checkpoint.get("cursor")
+
+        # A shard's checkpoint must describe that shard's own range. It can
+        # fail to when it was written by an earlier build whose resume was not
+        # shard-aware, or if the task count changed under a reused id. Trusting
+        # it would reintroduce exactly the skipping this filtering prevents, so
+        # discard it and sweep the owned range from the top instead.
+        if sharded and checkpoint_cursor:
+            shard_key = self.shard_key_of(checkpoint_cursor)
+            if shard_key is None or not self.owns(shard_key):
+                log.warning(
+                    "Discarding checkpoint cursor from outside this shard's range; "
+                    "sweeping from the top instead",
+                    extra={
+                        "checkpointId": self.checkpoint_id,
+                        "cursor": checkpoint_cursor,
+                        "shardKey": shard_key,
+                    },
+                )
+                checkpoint_cursor = None
+
         if checkpoint_cursor and (
             cursor is None
             or self.position_rank(checkpoint_cursor) < self.position_rank(cursor)
@@ -250,14 +294,22 @@ class BaseCrawler(ABC):
         )
         return state
 
-    def _verified_position(self, records: list[dict], label: str) -> dict[str, Any] | None:
+    def _verified_position(
+        self, records: list[dict], label: str, owned_only: bool = False
+    ) -> dict[str, Any] | None:
         """First record from Firestore whose object is really in storage.
 
         Metadata can outlive its object — a deleted bucket, a partial restore, a
         write that landed before an upload failed. Walking a few candidates
         rather than trusting the first keeps one stale row from rewinding or
         over-advancing the resume position.
+
+        With `owned_only`, records belonging to another shard are ignored. A
+        shard that finds none of its own simply starts its owned range from the
+        top: it re-probes, but never skips.
         """
+        skipped_foreign = 0
+
         for record in records:
             key = record.get("storage_key")
             position = None
@@ -265,6 +317,13 @@ class BaseCrawler(ABC):
                 position = self.position_from_key(key)
             if position is None:
                 continue
+
+            if owned_only:
+                shard_key = self.shard_key_of(position)
+                # An undeterminable shard key is not assumed to be ours.
+                if shard_key is None or not self.owns(shard_key):
+                    skipped_foreign += 1
+                    continue
             try:
                 if not self.storage.exists(key):
                     log.warning(
@@ -280,10 +339,23 @@ class BaseCrawler(ABC):
                 )
             return position
 
+        if owned_only and skipped_foreign and skipped_foreign == len(records):
+            # Normal in a parallel run: other shards simply wrote more recently.
+            # This shard sweeps its owned range from the top instead.
+            log.info(
+                "No stored document belongs to this shard; sweeping its range from the top",
+                extra={"label": label, "candidatesFromOtherShards": skipped_foreign},
+            )
+            return None
+
         if records:
             log.warning(
                 "No Firestore candidate could be confirmed in storage",
-                extra={"label": label, "candidates": len(records)},
+                extra={
+                    "label": label,
+                    "candidates": len(records),
+                    "fromOtherShards": skipped_foreign,
+                },
             )
         return None
 
