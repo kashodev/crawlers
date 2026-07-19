@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from typing import Any, Iterator
 from common.config import SiteConfig
 from common.http import FetchError, PoliteClient, RobotsDisallowed
 from common.metadata import MetadataRepository, build_repository
-from common.models import DocState, DocumentRecord, JobRecord, JobStatus
+from common.models import CheckpointRecord, DocState, DocumentRecord, JobRecord, JobStatus
 from common.storage import Storage, build_storage
 from utils.hashing import doc_id as make_doc_id
 from utils.hashing import sha256_bytes
@@ -43,6 +44,22 @@ class StopCrawl(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclass
+class ResumeState:
+    """Where this run should pick up, and how that was determined."""
+
+    cursor: dict[str, Any] | None = None
+    frontier: dict[str, Any] | None = None
+    sweep_complete: bool = False
+    source: str = "none"  # "checkpoint" | "storage" | "none"
+    last_status: str | None = None
+
+    @property
+    def is_resume(self) -> bool:
+        """True when a previous run left the descending sweep unfinished."""
+        return self.cursor is not None and not self.sweep_complete
 
 
 class BaseCrawler(ABC):
@@ -79,12 +96,185 @@ class BaseCrawler(ABC):
             },
         )
         self._consecutive_misses = 0
+        self._shutdown_reason: str | None = None
+        self._since_checkpoint = 0
+
+        self.resume = self.load_resume_state()
+        self.job.resumed_from = self.resume.cursor
+        self.job.resume_source = self.resume.source
+        self._checkpoint = CheckpointRecord(
+            site=config.name,
+            frontier=self.resume.frontier,
+            cursor=self.resume.cursor,
+            sweep_complete=self.resume.sweep_complete,
+            last_job_id=self.job.job_id,
+            last_status=JobStatus.RUNNING.value,
+        )
 
     # --- to implement in site modules ------------------------------------
 
     @abstractmethod
     def discover(self) -> Iterator[PdfCandidate]:
         """Yield PDF candidates, most recent first."""
+
+    def position_of(self, candidate: PdfCandidate) -> dict[str, Any] | None:
+        """Position of a candidate in this site's ordering, for checkpointing.
+
+        Returning None disables checkpointing for the site (it will still be
+        idempotent, just not resumable).
+        """
+        return None
+
+    def position_rank(self, position: dict[str, Any]) -> tuple:
+        """Sortable rank for a position; higher means more recent."""
+        return ()
+
+    def position_from_key(self, key: str) -> dict[str, Any] | None:
+        """Recover a position from a storage key, for checkpoint-less recovery."""
+        return None
+
+    # --- resume -----------------------------------------------------------
+
+    def load_resume_state(self) -> ResumeState:
+        """Determine where to resume.
+
+        Preference order:
+          1. the site's checkpoint document — one read, always current;
+          2. failing that, the stored objects themselves — slower, but it
+             recovers even if the checkpoint was lost or never written;
+          3. failing that, a fresh crawl from the top of the range.
+        """
+        if os.environ.get("CRAWLER_NO_RESUME") == "1":
+            log.info("Resume disabled; starting from the top of the range")
+            return ResumeState()
+
+        checkpoint = self.repo.get_checkpoint(self.config.name)
+        if checkpoint and (checkpoint.get("cursor") or checkpoint.get("frontier")):
+            state = ResumeState(
+                cursor=checkpoint.get("cursor"),
+                frontier=checkpoint.get("frontier"),
+                sweep_complete=bool(checkpoint.get("sweep_complete")),
+                source="checkpoint",
+                last_status=checkpoint.get("last_status"),
+            )
+            log.info(
+                "Loaded checkpoint",
+                extra={
+                    "site": self.config.name,
+                    "cursor": state.cursor,
+                    "frontier": state.frontier,
+                    "sweepComplete": state.sweep_complete,
+                    "lastStatus": state.last_status,
+                },
+            )
+            return state
+
+        recovered = self._recover_from_storage()
+        if recovered is not None:
+            log.warning(
+                "No checkpoint; recovered position from stored objects",
+                extra={"site": self.config.name, "frontier": recovered},
+            )
+            # Only the frontier is recoverable this way: storage shows what was
+            # downloaded, not how far the sweep probed past it. Treating that
+            # as the cursor too means the sweep re-probes the gap below it,
+            # which is correct, just not free.
+            return ResumeState(cursor=recovered, frontier=recovered, source="storage")
+
+        log.info("No prior state; starting a fresh crawl", extra={"site": self.config.name})
+        return ResumeState()
+
+    def _recover_from_storage(self) -> dict[str, Any] | None:
+        """Highest position present in storage, by listing stored objects."""
+        best: dict[str, Any] | None = None
+        best_rank: tuple = ()
+        count = 0
+        try:
+            for key in self.storage.list_keys():
+                position = self.position_from_key(key)
+                if position is None:
+                    continue
+                count += 1
+                rank = self.position_rank(position)
+                if not best_rank or rank > best_rank:
+                    best, best_rank = position, rank
+        except Exception as exc:
+            log.warning("Could not list storage for recovery", extra={"error": str(exc)})
+            return None
+        if count:
+            log.info("Scanned stored objects for recovery", extra={"objects": count})
+        return best
+
+    def note_progress(self, candidate: PdfCandidate) -> None:
+        """Advance the checkpoint after a document is stored.
+
+        The cursor only ever moves backwards (the sweep descends) and the
+        frontier only ever moves forwards, so an out-of-order candidate — a new
+        document found above the frontier — never rewinds resume position.
+        """
+        position = self.position_of(candidate)
+        if position is None:
+            return
+        rank = self.position_rank(position)
+
+        if self._checkpoint.frontier is None or rank > self.position_rank(
+            self._checkpoint.frontier
+        ):
+            self._checkpoint.frontier = position
+        if self._checkpoint.cursor is None or rank < self.position_rank(self._checkpoint.cursor):
+            self._checkpoint.cursor = position
+
+        # Persist periodically so a hard kill loses at most a few documents of
+        # progress, not the whole run.
+        self._since_checkpoint += 1
+        if self._since_checkpoint >= 25:
+            self.save_checkpoint()
+
+    def save_checkpoint(self, status: str | None = None) -> None:
+        self._checkpoint.last_job_id = self.job.job_id
+        self._checkpoint.last_status = status or JobStatus.RUNNING.value
+        self._checkpoint.updated_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.repo.save_checkpoint(self._checkpoint)
+            self._since_checkpoint = 0
+        except Exception as exc:
+            # A checkpoint failure must not kill a working crawl; worst case we
+            # resume from an older position next time.
+            log.error("Failed to save checkpoint", extra={"error": str(exc)})
+
+    def mark_sweep_complete(self) -> None:
+        """Called by a crawler once its descending sweep covers the full range."""
+        log.info("Sweep complete; future runs only check for new documents")
+        self._checkpoint.sweep_complete = True
+        self.save_checkpoint()
+
+    # --- graceful shutdown -------------------------------------------------
+
+    def _install_signal_handlers(self) -> None:
+        """Turn SIGTERM/SIGINT into a clean stop.
+
+        Cloud Run sends SIGTERM before killing a task that hits its timeout or
+        gets preempted. Catching it lets the run flush metadata and write a
+        checkpoint, so the next execution resumes instead of starting over.
+        """
+
+        def handle(signum, _frame):
+            name = signal.Signals(signum).name
+            if self._shutdown_reason is None:
+                self._shutdown_reason = f"received {name}"
+                log.warning("Shutdown signal received; stopping after current document",
+                            extra={"signal": name})
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, handle)
+            except ValueError:
+                # Not the main thread (e.g. under a test runner); skip.
+                log.debug("Could not install handler for %s", sig)
+
+    def _check_shutdown(self) -> None:
+        if self._shutdown_reason:
+            raise StopCrawl(self._shutdown_reason)
 
     # --- shared machinery -------------------------------------------------
 
@@ -171,6 +361,7 @@ class BaseCrawler(ABC):
 
             self.job.downloaded += 1
             self.job.bytes_stored += record.content_length
+            self.note_progress(candidate)
             log.info(
                 "Downloaded PDF",
                 extra={
@@ -207,6 +398,7 @@ class BaseCrawler(ABC):
 
     def run(self) -> JobRecord:
         """Execute the crawl and persist the job record."""
+        self._install_signal_handlers()
         log.info(
             "Crawl starting",
             extra={
@@ -215,12 +407,17 @@ class BaseCrawler(ABC):
                 "taskIndex": self.task_index,
                 "taskCount": self.task_count,
                 "seeds": self.config.seeds,
+                "resumeSource": self.resume.source,
+                "resumeCursor": self.resume.cursor,
+                "frontier": self.resume.frontier,
+                "isResume": self.resume.is_resume,
             },
         )
         self.repo.save_job(self.job)
 
         try:
             for candidate in self.discover():
+                self._check_shutdown()
                 self.job.discovered += 1
                 self.process(candidate)
 
@@ -237,10 +434,9 @@ class BaseCrawler(ABC):
             log.info("Crawl stopped early", extra={"reason": stop.reason})
 
         except KeyboardInterrupt:
-            self.job.status = JobStatus.FAILED.value
-            self.job.error = "interrupted"
-            log.warning("Crawl interrupted")
-            raise
+            self.job.status = JobStatus.STOPPED_EARLY.value
+            self.job.stop_reason = "interrupted"
+            log.warning("Crawl interrupted; progress checkpointed")
 
         except Exception as exc:
             # Mark the job FAILED so a partial run is never mistaken for a
@@ -252,9 +448,12 @@ class BaseCrawler(ABC):
 
         finally:
             self.job.finished_at = datetime.now(timezone.utc).isoformat()
+            # Order matters: flush documents first, then checkpoint. A
+            # checkpoint that outran its documents would skip them on resume.
             try:
                 self.repo.flush()
             finally:
+                self.save_checkpoint(self.job.status)
                 self.repo.save_job(self.job)
                 self.client.close()
 
@@ -265,10 +464,14 @@ class BaseCrawler(ABC):
                 "status": self.job.status,
                 "discovered": self.job.discovered,
                 "downloaded": self.job.downloaded,
+                "newDocuments": self.job.new_documents,
                 "skipped": self.job.skipped,
                 "failed": self.job.failed,
                 "bytesStored": self.job.bytes_stored,
                 "stopReason": self.job.stop_reason,
+                "resumeCursor": self._checkpoint.cursor,
+                "frontier": self._checkpoint.frontier,
+                "sweepComplete": self._checkpoint.sweep_complete,
             },
         )
         return self.job

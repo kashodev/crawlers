@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from common.config import MetadataConfig
-from common.models import DocumentRecord, JobRecord
+from common.models import CheckpointRecord, DocumentRecord, JobRecord
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,12 @@ class MetadataRepository(ABC):
     @abstractmethod
     def save_job(self, job: JobRecord) -> None: ...
 
+    @abstractmethod
+    def get_checkpoint(self, site: str) -> dict | None: ...
+
+    @abstractmethod
+    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None: ...
+
     def close(self) -> None:
         self.flush()
 
@@ -44,8 +50,9 @@ class LocalMetadataRepository(MetadataRepository):
     def __init__(self, root: str, documents_collection: str, jobs_collection: str):
         self.docs_dir = Path(root) / documents_collection
         self.jobs_dir = Path(root) / jobs_collection
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoints_dir = Path(root) / "checkpoints"
+        for directory in (self.docs_dir, self.jobs_dir, self.checkpoints_dir):
+            directory.mkdir(parents=True, exist_ok=True)
         self._pending: dict[str, DocumentRecord] = {}
         self._lock = threading.Lock()
 
@@ -81,6 +88,21 @@ class LocalMetadataRepository(MetadataRepository):
             json.dumps(job.to_dict(), indent=2), encoding="utf-8"
         )
 
+    def get_checkpoint(self, site: str) -> dict | None:
+        path = self.checkpoints_dir / f"{site}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log.warning("Corrupt checkpoint; ignoring", extra={"site": site})
+            return None
+
+    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None:
+        (self.checkpoints_dir / f"{checkpoint.site}.json").write_text(
+            json.dumps(checkpoint.to_dict(), indent=2), encoding="utf-8"
+        )
+
 
 class FirestoreMetadataRepository(MetadataRepository):
     def __init__(self, cfg: MetadataConfig):
@@ -89,6 +111,9 @@ class FirestoreMetadataRepository(MetadataRepository):
         self._client = firestore.Client(project=cfg.project, database=cfg.database)
         self._docs = self._client.collection(cfg.documents_collection)
         self._jobs = self._client.collection(cfg.jobs_collection)
+        # One document per site, keyed by site name: resume is a single point
+        # read, with no composite index or ordered query required.
+        self._checkpoints = self._client.collection("checkpoints")
         self._batch_size = min(cfg.batch_size, 500)
         self._pending: dict[str, DocumentRecord] = {}
         self._lock = threading.Lock()
@@ -128,6 +153,13 @@ class FirestoreMetadataRepository(MetadataRepository):
 
     def save_job(self, job: JobRecord) -> None:
         self._jobs.document(job.job_id).set(job.to_dict(), merge=True)
+
+    def get_checkpoint(self, site: str) -> dict | None:
+        snapshot = self._checkpoints.document(site).get()
+        return snapshot.to_dict() if snapshot.exists else None
+
+    def save_checkpoint(self, checkpoint: CheckpointRecord) -> None:
+        self._checkpoints.document(checkpoint.site).set(checkpoint.to_dict(), merge=True)
 
 
 def build_repository(cfg: MetadataConfig) -> MetadataRepository:

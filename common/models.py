@@ -57,6 +57,35 @@ class DocumentRecord:
 
 
 @dataclass
+class CheckpointRecord:
+    """Resumable position for a site, updated as documents are stored.
+
+    Two positions are tracked because they answer different questions:
+
+      frontier — the newest document ever downloaded. Anything above it is new
+                 material published since the last run.
+      cursor   — the oldest position the descending sweep has reached. A run
+                 that dies mid-sweep resumes just below this instead of
+                 re-probing the whole range from the top.
+
+    `sweep_complete` records whether the descending sweep ever reached the end
+    of the configured range. Until it does, every run resumes before it looks
+    for new documents.
+    """
+
+    site: str
+    frontier: dict[str, Any] | None = None
+    cursor: dict[str, Any] | None = None
+    sweep_complete: bool = False
+    last_job_id: str | None = None
+    last_status: str | None = None
+    updated_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class JobRecord:
     """One crawl run. Cloud Run task shards each write their own record."""
 
@@ -67,6 +96,12 @@ class JobRecord:
     finished_at: str | None = None
     task_index: int = 0
     task_count: int = 1
+    # Where this run picked up from, and how that position was recovered
+    # ("checkpoint", "storage", or "none" for a fresh crawl).
+    resumed_from: dict[str, Any] | None = None
+    resume_source: str = "none"
+    # Documents found by the new-material pass rather than the resume sweep.
+    new_documents: int = 0
     discovered: int = 0
     downloaded: int = 0
     skipped: int = 0

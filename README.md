@@ -25,6 +25,8 @@ writes to Cloud Storage and Firestore instead — no code change.
 | `--min-delay S` | seconds between requests to a host |
 | `--dry-run` | discover and log candidates, download nothing |
 | `--config` | override config path or `gs://` URI |
+| `--show-checkpoint` | print the saved resume position and exit |
+| `--no-resume` | ignore the checkpoint and crawl the range from the top |
 
 ## Layout
 
@@ -99,6 +101,46 @@ and is a normal outcome; only `FAILED` exits non-zero so Cloud Run retries it.
 (`limits.consecutive_miss_limit`). Within one Toronto year,
 `per_unit_miss_limit` consecutive gaps means that year is exhausted and the
 crawl moves to the previous one.
+
+## Resuming after a failure
+
+A crawl that dies — task timeout, network failure, preemption, a crash — picks
+up where it left off on the next execution rather than restarting.
+
+Each site keeps a checkpoint (Firestore `checkpoints/{site}`, or
+`data/_metadata/checkpoints/` locally) holding two positions:
+
+- **frontier** — newest document ever downloaded. Anything above it is new
+  material published since the last run.
+- **cursor** — oldest position the descending sweep reached. A dead run resumes
+  just below this.
+
+Every run does the same two things, in this order:
+
+1. **Resume** the unfinished sweep from below the cursor. Skipped entirely once
+   `sweep_complete` is set.
+2. **Check for new documents** above the frontier — only the current year
+   (Toronto) or newest session (Ontario) can gain them, so this is cheap.
+
+Resume position is recovered in preference order: the checkpoint (one read),
+then by listing stored objects in GCS and parsing the highest key, then a fresh
+crawl. The middle path means a lost or never-written checkpoint still doesn't
+force a full re-crawl.
+
+```bash
+docker compose run --rm crawler --site toronto_bylaws --show-checkpoint
+docker compose run --rm crawler --site toronto_bylaws --no-resume   # force full re-crawl
+```
+
+**Graceful shutdown.** Cloud Run sends `SIGTERM` before killing a task that hits
+its timeout or gets preempted. The crawler catches it, finishes the document in
+flight, flushes metadata, writes a checkpoint, and exits 0 — so the next
+execution continues instead of starting over. Documents are always flushed
+*before* the checkpoint, since a checkpoint ahead of its documents would skip
+them on resume.
+
+Because of this, a long backfill can be run as repeated bounded executions
+rather than one job that must survive for hours.
 
 ## Deploy
 

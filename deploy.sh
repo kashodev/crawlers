@@ -110,6 +110,9 @@ for site in ontario_legislative_bills toronto_bylaws; do
   echo "==> Cloud Run Job ${job}"
 
   # 1 vCPU / 1 GiB: this workload downloads and stores, it doesn't parse PDFs.
+  # A task that hits --task-timeout gets SIGTERM, which the crawler handles by
+  # checkpointing — so a retry resumes rather than restarting. Same for the two
+  # automatic retries.
   args=(
     --image="${IMAGE}"
     --region="${REGION}"
@@ -140,7 +143,14 @@ Follow logs:
   gcloud beta run jobs logs tail crawler-toronto-bylaws --region=${REGION}
 
 PDFs:     gs://${PDF_BUCKET}/
-Metadata: Firestore collections 'documents' and 'jobs'
+Metadata: Firestore collections 'documents', 'jobs', and 'checkpoints'
+
+Crawls resume automatically: a run that times out or fails checkpoints its
+position, and the next execution continues from there, then checks for new
+documents. Re-executing the same job is the way to continue a large backfill.
+To force a full re-crawl instead:
+
+  gcloud run jobs execute JOB --region=${REGION} --update-env-vars=CRAWLER_NO_RESUME=1
 
 Cost note: idle cost is storage only — Cloud Run Jobs bills nothing between runs.
 To cut retention cost, add a lifecycle rule moving PDFs to Nearline after 30 days:

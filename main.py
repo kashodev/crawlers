@@ -59,6 +59,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="discover and log candidates without downloading or writing metadata",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="ignore the saved checkpoint and crawl the range from the top",
+    )
+    parser.add_argument(
+        "--show-checkpoint",
+        action="store_true",
+        help="print the saved resume position for the site and exit",
+    )
     parser.add_argument("--list-sites", action="store_true")
     return parser.parse_args(argv)
 
@@ -81,6 +91,20 @@ def main(argv: list[str] | None = None) -> int:
 
     config_path = args.config or os.environ.get("CONFIG_URI") or str(ROOT / site / "config.yaml")
     cfg = config_module.load(config_path)
+
+    if args.show_checkpoint:
+        import json
+
+        from common.metadata import build_repository
+
+        checkpoint = build_repository(cfg.metadata).get_checkpoint(cfg.name)
+        print(json.dumps(checkpoint, indent=2) if checkpoint else "no checkpoint saved")
+        return 0
+
+    # Read by BaseCrawler.load_resume_state; also settable as an env var so a
+    # Cloud Run job can force a full re-crawl without changing its args.
+    if args.no_resume:
+        os.environ["CRAWLER_NO_RESUME"] = "1"
 
     if args.max_documents is not None:
         cfg.limits.max_documents = args.max_documents

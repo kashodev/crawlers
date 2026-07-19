@@ -45,6 +45,17 @@ STAGE_CODES = {
 }
 
 
+def _bill_rank(number: str) -> tuple[int, str]:
+    """Sortable rank for a bill number.
+
+    Bill numbers are usually integers but can carry a letter suffix (e.g. "5a"
+    for a substituted bill), so sort numerically then lexically rather than
+    assuming int().
+    """
+    match = re.match(r"(\d+)(.*)", str(number))
+    return (int(match.group(1)), match.group(2)) if match else (0, str(number))
+
+
 class OntarioLegislativeBillsCrawler(BaseCrawler):
     @property
     def base_url(self) -> str:
@@ -108,14 +119,7 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
                 normalize(anchor["href"], session_url),
             )
 
-        def sort_key(number: str):
-            # Bill numbers are usually integers but can carry a letter suffix
-            # (e.g. "5a" for a substituted bill), so sort numerically then
-            # lexically rather than assuming int().
-            digits = re.match(r"(\d+)(.*)", number)
-            return (int(digits.group(1)), digits.group(2)) if digits else (0, number)
-
-        ordered = sorted(bills.items(), key=lambda item: sort_key(item[0]), reverse=True)
+        ordered = sorted(bills.items(), key=lambda item: _bill_rank(item[0]), reverse=True)
         log.info("Discovered bills in session", extra={"url": session_url, "count": len(ordered)})
         return [(number, title, url) for number, (title, url) in ordered]
 
@@ -191,8 +195,62 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
             log.debug("Bill has no PDFs", extra={"url": bill_url, "bill": number})
         return candidates
 
+    # --- resume support ---------------------------------------------------
+
+    def position_of(self, candidate: PdfCandidate) -> dict | None:
+        attrs = candidate.attributes
+        if "parliament" not in attrs:
+            return None
+        return {
+            "parliament": attrs["parliament"],
+            "session": attrs["session"],
+            "bill": attrs["billNumber"],
+        }
+
+    def position_rank(self, position: dict) -> tuple:
+        return (
+            int(position.get("parliament", 0)),
+            int(position.get("session", 0)),
+            _bill_rank(str(position.get("bill", "0"))),
+        )
+
+    def position_from_key(self, key: str) -> dict | None:
+        match = re.match(r"^parliament-(\d+)/session-(\d+)/bill-([\w-]+)/", key)
+        if not match:
+            return None
+        return {
+            "parliament": int(match.group(1)),
+            "session": int(match.group(2)),
+            "bill": match.group(3),
+        }
+
     def discover(self) -> Iterator[PdfCandidate]:
-        for parliament, session, session_url in self.find_sessions():
+        state = self.resume
+        sessions = self.find_sessions()
+
+        if state.is_resume:
+            cursor = state.cursor or {}
+            log.info("Resuming interrupted sweep", extra={"cursor": cursor, "source": state.source})
+            yield from self._sweep(sessions, resume_below=cursor)
+        elif not state.sweep_complete:
+            log.info("Starting full sweep", extra={"sessions": len(sessions)})
+            yield from self._sweep(sessions, resume_below=None)
+        else:
+            log.info("Sweep already complete; checking for new bills only")
+
+        self.mark_sweep_complete()
+        yield from self._check_for_new(sessions, state.frontier)
+
+    def _sweep(
+        self, sessions: list[tuple[int, int, str]], resume_below: dict | None
+    ) -> Iterator[PdfCandidate]:
+        resume_rank = self.position_rank(resume_below) if resume_below else None
+
+        for parliament, session, session_url in sessions:
+            # Skip sessions newer than the resume point; they were done already.
+            if resume_rank and (parliament, session) > (resume_rank[0], resume_rank[1]):
+                continue
+
             bills = self.find_bills(session_url)
             if not bills:
                 # An empty session page is a structural miss worth counting.
@@ -200,17 +258,51 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
                 continue
 
             for number, title, bill_url in bills:
-                # Shard on the bill so all of one bill's PDFs land in one task.
-                if not self.owns(f"{parliament}-{session}-{number}"):
+                rank = (parliament, session, _bill_rank(number))
+                # Within the resume session, skip bills at or above the cursor.
+                if resume_rank and rank >= resume_rank:
                     continue
+                yield from self._bill_candidates(parliament, session, number, title, bill_url)
 
-                pdfs = self.find_bill_pdfs(bill_url, parliament, session, number, title)
-                if not pdfs:
-                    self.record_miss()
-                    continue
+    def _check_for_new(
+        self, sessions: list[tuple[int, int, str]], frontier: dict | None
+    ) -> Iterator[PdfCandidate]:
+        """Look for bills introduced since the last run.
 
-                self.record_hit()
-                yield from pdfs
+        New bills only ever appear in the newest session, so this re-reads one
+        session page and takes anything numbered above the frontier.
+        """
+        if not frontier or not sessions:
+            return
+
+        parliament, session, session_url = sessions[0]
+        frontier_rank = self.position_rank(frontier)
+        log.info("Checking for new bills", extra={"session": session_url, "frontier": frontier})
+
+        for number, title, bill_url in self.find_bills(session_url):
+            rank = (parliament, session, _bill_rank(number))
+            if rank <= frontier_rank:
+                continue
+            for candidate in self._bill_candidates(
+                parliament, session, number, title, bill_url
+            ):
+                self.job.new_documents += 1
+                yield candidate
+
+    def _bill_candidates(
+        self, parliament: int, session: int, number: str, title: str, bill_url: str
+    ) -> Iterator[PdfCandidate]:
+        # Shard on the bill so all of one bill's PDFs land in one task.
+        if not self.owns(f"{parliament}-{session}-{number}"):
+            return
+
+        pdfs = self.find_bill_pdfs(bill_url, parliament, session, number, title)
+        if not pdfs:
+            self.record_miss()
+            return
+
+        self.record_hit()
+        yield from pdfs
 
 
 CRAWLER = OntarioLegislativeBillsCrawler

@@ -11,6 +11,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Iterator
 
 from common.config import StorageConfig
 
@@ -27,6 +28,14 @@ class Storage(ABC):
 
     @abstractmethod
     def uri(self, key: str) -> str: ...
+
+    @abstractmethod
+    def list_keys(self) -> Iterator[str]:
+        """Yield every stored key, relative to the configured prefix.
+
+        Used only to rebuild a resume position when the checkpoint is missing,
+        so the cost of a full listing is acceptable there.
+        """
 
 
 class LocalStorage(Storage):
@@ -61,6 +70,14 @@ class LocalStorage(Storage):
     def uri(self, key: str) -> str:
         return str(self._path(key))
 
+    def list_keys(self) -> Iterator[str]:
+        root = self._path("")
+        if not root.exists():
+            return
+        for path in root.rglob("*"):
+            if path.is_file() and not path.name.endswith(".part"):
+                yield str(path.relative_to(root))
+
 
 class GCSStorage(Storage):
     def __init__(self, bucket: str, prefix: str = ""):
@@ -85,6 +102,11 @@ class GCSStorage(Storage):
 
     def uri(self, key: str) -> str:
         return f"gs://{self.bucket_name}/{self._key(key)}"
+
+    def list_keys(self) -> Iterator[str]:
+        offset = len(self.prefix) + 1 if self.prefix else 0
+        for blob in self._client.list_blobs(self._bucket, prefix=self.prefix or None):
+            yield blob.name[offset:]
 
 
 def build_storage(cfg: StorageConfig) -> Storage:
