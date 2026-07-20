@@ -1,0 +1,60 @@
+# Ontario e-Laws — current consolidated statutes and regulations.
+#
+# Enumerated via the site's JSON API (browse-search); each law page is server
+# prerendered HTML that we render to PDF with WeasyPrint. Laws are re-published
+# in place as amended, so runs after the first re-render only what changed.
+name: ontario-elaws
+module: ontario_elaws
+
+seeds:
+  - https://www.ontario.ca/laws/search
+
+politeness:
+  # MUST stay non-browser: ontario.ca serves a JavaScript shell to browser
+  # User-Agents and full prerendered HTML to everything else. A browser UA here
+  # silently breaks rendering (no .WordSection1 in the shell).
+  user_agent: "pdf-research-crawler/1.0 (+RAG test-data collection; contact: kasho.dev@gmail.com)"
+  # robots.txt declares Crawl-delay: 1; honoured automatically. This is the floor.
+  min_delay_seconds: 1.0
+  respect_robots: true
+  max_concurrent_requests: 2
+  jitter_seconds: 0.3
+
+retry:
+  max_attempts: 4
+  backoff_base_seconds: 2.0
+  backoff_max_seconds: 60.0
+  timeout_seconds: 60.0
+  # Some consolidated acts are large (>1 MB HTML) and slower to fetch + render.
+  download_timeout_seconds: 300.0
+
+limits:
+  # Every law is a deliberate fetch, not a blind probe, so a long run of
+  # failures means the page structure changed — worth stopping on.
+  consecutive_miss_limit: 1000
+  per_unit_miss_limit: 200
+  max_documents: null
+  max_pages: null
+  # Rendered legal PDFs are well under this; guards a runaway render.
+  max_pdf_bytes: 134217728
+
+storage:
+  backend: local
+  local_root: data
+  prefix: ontario_elaws
+
+metadata:
+  backend: local
+  local_root: data/_metadata
+  documents_collection: documents
+  jobs_collection: jobs
+  batch_size: 400
+
+options:
+  # "current" = consolidated laws in force. "rrs" (repealed/revoked/spent) is
+  # deferred; switching this enables that set once the crawler handles it.
+  selection: current
+  result_types:
+    - statute
+    - regulation
+  api_page_size: 100

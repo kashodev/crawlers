@@ -148,7 +148,7 @@ echo "    waiting 30s for IAM to propagate"
 sleep 30
 
 echo "==> Uploading site configs"
-for site in ontario_legislative_bills toronto_bylaws; do
+for site in ontario_legislative_bills toronto_bylaws ontario_elaws; do
   gcloud storage cp "${site}/config.yaml" "gs://${CONFIG_BUCKET}/sites/${site}.yaml"
 done
 
@@ -203,7 +203,7 @@ fi
 
 # One job per site: they have different runtimes and politeness budgets, and
 # separate jobs keep their logs, retries, and failures independently visible.
-for site in ontario_legislative_bills toronto_bylaws; do
+for site in ontario_legislative_bills toronto_bylaws ontario_elaws; do
   job="crawler-${site//_/-}"
   echo "==> Cloud Run Job ${job}"
 

@@ -103,6 +103,7 @@ class BaseCrawler(ABC):
             },
         )
         self._consecutive_misses = 0
+        self._consecutive_failures = 0
         self._shutdown_reason: str | None = None
         self._since_checkpoint = 0
         self._last_heartbeat = time.monotonic()
@@ -575,6 +576,15 @@ class BaseCrawler(ABC):
         self._consecutive_misses = 0
         self.job.consecutive_misses = 0
 
+    def reprocess_reason(self, existing: dict, candidate: PdfCandidate) -> str | None:
+        """Why an already-stored document should be re-fetched, or None to skip.
+
+        Default None: a stored document is immutable (bylaws, bills). Override
+        for sources that get re-published in place — e.g. a consolidated law
+        whose amendment date advanced — to re-render only what actually changed.
+        """
+        return None
+
     def _should_skip(self, doc_id: str, candidate: PdfCandidate) -> bool:
         """Idempotency check: has this document already been stored successfully?"""
         existing = self.repo.get_document(doc_id)
@@ -582,13 +592,41 @@ class BaseCrawler(ABC):
             key = existing.get("storage_key") or candidate.storage_key
             # Trust metadata only if the object is actually still in storage;
             # otherwise a deleted bucket object would never be re-fetched.
-            if self.storage.exists(key):
-                return True
-            log.info(
-                "Metadata says downloaded but object is missing; re-fetching",
-                extra={"docId": doc_id, "url": candidate.url},
-            )
+            if not self.storage.exists(key):
+                log.info(
+                    "Metadata says downloaded but object is missing; re-fetching",
+                    extra={"docId": doc_id, "url": candidate.url},
+                )
+                return False
+            reason = self.reprocess_reason(existing, candidate)
+            if reason:
+                log.info(
+                    "Re-processing changed document",
+                    extra={"docId": doc_id, "url": candidate.url, "reason": reason},
+                )
+                return False
+            return True
         return False
+
+    def produce_document(self, candidate: PdfCandidate, record: DocumentRecord) -> bytes:
+        """Fetch (and if needed transform) a candidate into the bytes to store.
+
+        Default: download the URL and require a PDF — the behaviour the bylaw
+        and bill crawlers rely on. Override to store a source that isn't already
+        a PDF (e.g. render HTML). Implementations must set `record.http_status`,
+        may enrich `record.attributes`, and should raise FetchError on a body
+        that isn't the expected document rather than storing an error page.
+        """
+        resp = self.client.download(candidate.url, self.config.limits.max_pdf_bytes)
+        record.http_status = resp.status_code
+
+        # A 200 that returns an HTML error page is a miss, not a document.
+        if resp.content_type not in ("application/pdf", "application/octet-stream"):
+            if not resp.content.startswith(b"%PDF"):
+                raise FetchError(
+                    f"expected PDF, got {resp.content_type or 'unknown'}", resp.status_code
+                )
+        return resp.content
 
     def process(self, candidate: PdfCandidate) -> str:
         """Download and store one candidate. Returns the resulting DocState."""
@@ -614,28 +652,21 @@ class BaseCrawler(ABC):
         )
 
         try:
-            resp = self.client.download(candidate.url, self.config.limits.max_pdf_bytes)
-            record.http_status = resp.status_code
+            data = self.produce_document(candidate, record)
 
-            # A 200 that returns an HTML error page is a miss, not a document.
-            if resp.content_type not in ("application/pdf", "application/octet-stream"):
-                if not resp.content.startswith(b"%PDF"):
-                    raise FetchError(
-                        f"expected PDF, got {resp.content_type or 'unknown'}", resp.status_code
-                    )
-
-            record.content_hash = sha256_bytes(resp.content)
-            record.content_length = len(resp.content)
+            record.content_hash = sha256_bytes(data)
+            record.content_length = len(data)
             record.storage_key = candidate.storage_key
-            record.storage_uri = self.storage.write(candidate.storage_key, resp.content)
+            record.storage_uri = self.storage.write(candidate.storage_key, data)
             record.state = DocState.DOWNLOADED.value
             record.downloaded_at = datetime.now(timezone.utc).isoformat()
 
             self.job.downloaded += 1
             self.job.bytes_stored += record.content_length
+            self._consecutive_failures = 0
             self.note_progress(candidate)
             log.info(
-                "Downloaded PDF",
+                "Stored document",
                 extra={
                     "url": candidate.url,
                     "uri": record.storage_uri,
@@ -655,17 +686,31 @@ class BaseCrawler(ABC):
             record.error = f"{type(exc).__name__}: {exc}"
             record.http_status = record.http_status or getattr(exc, "status_code", None)
             self.job.failed += 1
+            self._consecutive_failures += 1
             log.error(
-                "Failed to download PDF",
+                "Failed to store document",
                 extra={
                     "url": candidate.url,
                     "error": record.error,
                     "attempt": record.attempts,
+                    "consecutiveFailures": self._consecutive_failures,
                 },
             )
 
         record.updated_at = datetime.now(timezone.utc).isoformat()
         self.repo.stage_document(record)
+
+        # Circuit breaker: a long run of failures means something systemic broke
+        # (page layout changed, renderer down), not bad luck on one document.
+        # Stop rather than hammer the origin across the whole keyspace. Raised
+        # after staging so this document's FAILED record is still persisted.
+        limit = self.config.limits.consecutive_failure_limit
+        if limit and self._consecutive_failures >= limit:
+            raise StopCrawl(
+                f"{self._consecutive_failures} consecutive failures; stopping to avoid "
+                "hammering the origin (likely a systemic break, not per-document)"
+            )
+
         return record.state
 
     def run(self) -> JobRecord:

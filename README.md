@@ -1,7 +1,8 @@
 # PDF Crawler
 
-Downloads public-sector PDFs (Ontario legislature bills, Toronto bylaws) as RAG
-test data. Runs to completion and exits, so it costs nothing between crawls.
+Downloads public-sector PDFs (Ontario legislature bills, Toronto bylaws,
+Ontario e-Laws statutes and regulations) as RAG test data. Runs to completion
+and exits, so it costs nothing between crawls.
 
 ## Quick start
 
@@ -31,17 +32,59 @@ writes to Cloud Storage and Firestore instead — no code change.
 ## Layout
 
 ```
-common/    config, HTTP+robots, storage, metadata, base crawler
+common/    config, HTTP+robots, storage, metadata, base crawler, PDF renderer
 utils/     logging, hashing, URL helpers
 ontario_legislative_bills/   crawler.py + config.yaml
 toronto_bylaws/              crawler.py + config.yaml
+ontario_elaws/               crawler.py + config.yaml
 main.py    entrypoint
 ```
 
 Adding a site: create `<site>/crawler.py` subclassing `BaseCrawler`, implement
 `discover()` yielding `PdfCandidate`s newest-first, export `CRAWLER`, and add a
 `config.yaml`. Everything else — retries, idempotency, storage, metadata, job
-accounting — is inherited.
+accounting — is inherited. Two hooks let a site depart from the "download an
+existing PDF, store it once" default:
+
+- **`produce_document(candidate, record)`** — return the bytes to store.
+  Default downloads the URL and requires a PDF; override to transform a source
+  that isn't already a PDF (e-Laws renders HTML → PDF).
+- **`reprocess_reason(existing, candidate)`** — return why an already-stored
+  document should be re-fetched, or `None` to skip. Default `None` (documents
+  are immutable); override for sources re-published in place.
+
+## Ontario e-Laws (`ontario_elaws`)
+
+Current consolidated **statutes and regulations**. Two things make this site
+different from the bylaw/bill crawlers:
+
+**No PDF exists.** Laws are served only as a web page or a JavaScript-gated Word
+file. The page is server-side *prerendered* for non-browser User-Agents (the
+full text sits in `.WordSection1`, or `.ontario-row` for short regulations),
+which the crawler renders to PDF with WeasyPrint (`common/pdf.py`) — faithful
+legal text and structure, no headless browser.
+
+> A browser-like User-Agent gets a JavaScript shell with no law text. The
+> configured UA **must stay non-browser** or rendering silently fails.
+
+**Enumeration is a JSON API**, reverse-engineered from the site's React bundle:
+`GET /laws/api/v2/legislation/en/browse-search?text=&selection=current&result=statute&result=regulation&sort=Newest`.
+Each hit gives the page alias, citation, parent act, title, and a monotonic
+`sort` value used as the resume cursor. Sharding is by law `code`.
+
+**Laws are re-published in place** as they're amended, unlike bylaws/bills. So
+runs after the first re-render only what changed: `reprocess_reason` compares
+the global e-Laws currency date against each stored law's and skips when it
+hasn't moved.
+
+Metadata adds `currencyDate` (the global "as of" date), `consolidationDateFrom`,
+`lastAmendment`, `citation`, `parentAct`, and a reserved **`status`** field
+(`current` now; the API's `selection=rrs` will populate repealed/revoked/spent
+later — deferred, but the column is in place).
+
+WeasyPrint needs system libraries (Pango/Cairo), installed in the Dockerfile.
+No new Firestore index — e-Laws reuses the `documents` collection and the
+existing resume indexes.
 
 ## Sources
 

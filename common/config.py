@@ -49,6 +49,10 @@ class RetryConfig:
 class LimitsConfig:
     # Hard stop after this many consecutive probes that yield no PDF.
     consecutive_miss_limit: int = 1000
+    # Hard stop after this many consecutive *failures* (fetch/render errors, as
+    # opposed to misses). Guards against a systemic break — a changed page
+    # layout, a broken renderer — hammering the origin for the whole keyspace.
+    consecutive_failure_limit: int = 25
     # Per-listing-unit tolerance (e.g. gaps within one Toronto bylaw year).
     per_unit_miss_limit: int = 50
     max_documents: int | None = None

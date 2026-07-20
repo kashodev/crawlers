@@ -3,5 +3,10 @@ beautifulsoup4==4.12.3
 lxml==5.3.0
 PyYAML==6.0.2
 python-dotenv==1.0.1
+weasyprint==62.3
+# WeasyPrint 62.x calls pydyf.Stream.transform(a..f); older pydyf lacks that
+# signature and fails with "'super' object has no attribute 'transform'". Pin
+# the matching pydyf rather than letting the resolver pick an incompatible one.
+pydyf==0.11.0
 google-cloud-storage==2.18.2
 google-cloud-firestore==2.19.0
