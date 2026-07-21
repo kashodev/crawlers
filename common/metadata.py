@@ -66,6 +66,17 @@ class MetadataRepository(ABC):
         """Merge partial field updates into existing documents, in batches."""
 
     @abstractmethod
+    def replace_documents(self, updates: list[tuple[str, dict]]) -> None:
+        """Replace top-level fields wholesale, in batches.
+
+        Unlike update_documents, a map-valued field is set to exactly the given
+        map — keys absent from it are removed. Use this to rewrite a nested map
+        like `attributes` when a migration needs to drop a legacy key, not just
+        add one. (update_documents deep-merges on Firestore, so it can add but
+        never remove a nested key.)
+        """
+
+    @abstractmethod
     def latest_downloaded(self, site: str, limit: int = 5) -> list[dict]:
         """Most recently downloaded documents, newest write first.
 
@@ -178,6 +189,12 @@ class LocalMetadataRepository(MetadataRepository):
             record = json.loads(path.read_text(encoding="utf-8"))
             record.update(fields)
             path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+    def replace_documents(self, updates: list[tuple[str, dict]]) -> None:
+        # Locally, dict.update already sets each top-level field to exactly the
+        # given value (a nested map replaces the old one), which is the wholesale
+        # semantics we want. Firestore is where this must differ from a merge.
+        self.update_documents(updates)
 
     def _downloaded(self, site: str) -> list[dict]:
         records = []
@@ -297,6 +314,17 @@ class FirestoreMetadataRepository(MetadataRepository):
             batch = self._client.batch()
             for doc_id, fields in updates[start : start + 500]:
                 batch.set(self._docs.document(doc_id), fields, merge=True)
+            batch.commit()
+
+    def replace_documents(self, updates: list[tuple[str, dict]]) -> None:
+        # batch.update (as opposed to set(merge=True)) assigns each field
+        # wholesale: a map-valued field is replaced entirely, so keys omitted
+        # from the new map are deleted. This is how a legacy nested key like
+        # attributes.language is removed rather than left behind.
+        for start in range(0, len(updates), 500):
+            batch = self._client.batch()
+            for doc_id, fields in updates[start : start + 500]:
+                batch.update(self._docs.document(doc_id), fields)
             batch.commit()
 
     def _query_downloaded(self, site: str, order_field: str, limit: int) -> list[dict]:
