@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from common.crawler import BaseCrawler, PdfCandidate  # noqa: F401
+from utils.locale import to_locale
 
 log = logging.getLogger(__name__)
 
@@ -277,6 +278,9 @@ class TorontoBylawsCrawler(BaseCrawler):
             attributes={
                 "jurisdiction": "toronto",
                 "documentType": "bylaw",
+                # BCP 47 list, consistent with migration 0003. Toronto bylaws
+                # are published in English.
+                "locale": to_locale("en"),
                 "year": year,
                 "bylawNumber": number,
                 # Canonical citation, e.g. "1234-2024".

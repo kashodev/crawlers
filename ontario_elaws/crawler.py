@@ -41,6 +41,7 @@ from common.crawler import BaseCrawler, PdfCandidate
 from common.http import FetchError
 from common.models import DocumentRecord
 from common.pdf import PdfRenderError, render_law_pdf
+from utils.locale import to_locale
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +181,10 @@ class OntarioELawsCrawler(BaseCrawler):
             attributes={
                 "jurisdiction": "ontario",
                 "documentType": law["type"],
+                # BCP 47 list, consistent with migration 0003. We enumerate and
+                # render the English (/en/) consolidation; a French or bilingual
+                # pass would extend this to ["en-CA", "fr-CA"].
+                "locale": to_locale("en"),
                 "lawCode": law["code"],
                 "alias": alias,
                 "citation": law.get("citation"),

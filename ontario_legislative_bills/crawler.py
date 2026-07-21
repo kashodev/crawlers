@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 
 from common.crawler import BaseCrawler, PdfCandidate
 from common.http import FetchError, RobotsDisallowed
+from utils.locale import to_locale
 from utils.urls import filename_of, normalize
 
 log = logging.getLogger(__name__)
@@ -208,7 +209,10 @@ class OntarioLegislativeBillsCrawler(BaseCrawler):
                         "title": title,
                         "status": status,
                         "stage": stage,
-                        "language": language,
+                        # BCP 47 list, consistent with migration 0003. The
+                        # source "e"/"f" flag maps to en-CA/fr-CA; we no longer
+                        # store the raw scalar the migration removed.
+                        "locale": to_locale(language),
                         "linkLabel": label,
                         "fileName": name,
                         "billUrl": bill_url,
