@@ -50,7 +50,7 @@ MIGRATE_JOB="crawler-migrate"
 # The one place site modules are listed. Config upload, job creation, and the
 # closing "how to trigger" hints all derive from this, so adding a site here
 # updates every step — no more drift between the jobs and the printed commands.
-SITES=(ontario_legislative_bills toronto_bylaws ontario_elaws)
+SITES=(ontario_legislative_bills toronto_bylaws ontario_elaws canada_federal_laws)
 
 echo "==> Project ${PROJECT} / region ${REGION}"
 gcloud config set project "${PROJECT}" >/dev/null

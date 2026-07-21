@@ -1,0 +1,59 @@
+# Canada federal law — consolidated Acts and Regulations (current + repealed).
+#
+# Alphabetical index pages list every law with a direct /PDF/{ID}.pdf link and a
+# repealed/current marker. We download all PDFs, save detail-page metadata for
+# each, and mark status verbatim as the site labels it.
+name: canada-federal-laws
+module: canada_federal_laws
+
+seeds:
+  - https://laws-lois.justice.gc.ca/eng/acts/
+  - https://laws-lois.justice.gc.ca/eng/regulations/
+
+politeness:
+  user_agent: "pdf-research-crawler/1.0 (+RAG test-data collection; contact: kasho.dev@gmail.com)"
+  # No robots.txt and no declared Crawl-delay, so this floor is the only pacing.
+  # Keep it conservative: single federal-government origin, and each law costs a
+  # letter-page share plus a detail-page fetch plus the PDF.
+  min_delay_seconds: 1.0
+  respect_robots: true
+  max_concurrent_requests: 2
+  jitter_seconds: 0.3
+
+retry:
+  max_attempts: 4
+  backoff_base_seconds: 2.0
+  backoff_max_seconds: 60.0
+  timeout_seconds: 60.0
+  download_timeout_seconds: 300.0
+
+limits:
+  consecutive_miss_limit: 1000
+  per_unit_miss_limit: 200
+  consecutive_failure_limit: 25
+  max_documents: null
+  max_pages: null
+  max_pdf_bytes: 268435456
+
+storage:
+  backend: local
+  local_root: data
+  prefix: canada_federal_laws
+
+metadata:
+  backend: local
+  local_root: data/_metadata
+  documents_collection: documents
+  jobs_collection: jobs
+  batch_size: 400
+
+options:
+  # Both consolidated sets. Drop one to crawl only acts or only regulations.
+  types:
+    - act
+    - regulation
+  # Letters to sweep; empty/unset means A-Z. Missing letters 404 harmlessly.
+  letters: []
+  # Off by default: routine runs don't HEAD-probe every stored law. Turn on for
+  # a periodic freshness sweep that re-downloads re-consolidated PDFs.
+  reprocess_on_change: false

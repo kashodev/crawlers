@@ -1,8 +1,9 @@
 # PDF Crawler
 
 Downloads public-sector PDFs (Ontario legislature bills, Toronto bylaws,
-Ontario e-Laws statutes and regulations) as RAG test data. Runs to completion
-and exits, so it costs nothing between crawls.
+Ontario e-Laws statutes and regulations, Canada federal Acts and Regulations)
+as RAG test data. Runs to completion and exits, so it costs nothing between
+crawls.
 
 ## Quick start
 
@@ -37,6 +38,7 @@ utils/     logging, hashing, URL helpers
 ontario_legislative_bills/   crawler.py + config.yaml
 toronto_bylaws/              crawler.py + config.yaml
 ontario_elaws/               crawler.py + config.yaml
+canada_federal_laws/         crawler.py + config.yaml
 main.py    entrypoint
 ```
 
@@ -85,6 +87,34 @@ later — deferred, but the column is in place).
 WeasyPrint needs system libraries (Pango/Cairo), installed in the Dockerfile.
 No new Firestore index — e-Laws reuses the `documents` collection and the
 existing resume indexes.
+
+## Canada federal laws (`canada_federal_laws`)
+
+Consolidated federal **Acts and Regulations**, including repealed/revoked ones.
+The simplest of the sites: server-rendered alphabetical index pages
+(`/eng/acts/{A..Z}.html`, `/eng/regulations/{A..Z}.html`) list every law with a
+direct `/PDF/{ID}.pdf` link — real PDFs, no rendering.
+
+Each letter page lists current and repealed laws together; a repealed entry is
+marked with a `Repealed` span carrying its citation (`[Repealed, 1997, c. 20,
+s. 44]`). Both are crawled; `status` is stored **verbatim as the site labels
+it** (`current` / `repealed`), with the citation in `statusCitation`. Every
+downloaded law also gets its detail page fetched for consolidation metadata:
+`currentToDate`, `lastAmendedDate`, and (regulations) `enablingAct`. That extra
+fetch means up to three requests per law (letter page share + detail + PDF).
+
+**Sharding is by `(type, letter)`** — a task owns whole letter pages, so it only
+fetches its own. Storage keys embed the letter (`acts/A/A-1.pdf`) so a stored
+object alone identifies its shard, since a regulation's SOR id doesn't encode
+the letter it's listed under.
+
+**Change detection** (`reprocess_reason`) is **off by default**
+(`reprocess_on_change`). When on, each already-stored law is HEAD-probed and
+re-downloaded if its `ETag`/`Last-Modified` moved — a cheap bodyless check for a
+periodic freshness sweep. `sourceEtag`/`sourceLastModified` are captured at
+download time as the comparison baseline.
+
+No new Firestore index; reuses the `documents` collection and resume indexes.
 
 ## Sources
 
