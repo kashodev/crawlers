@@ -47,6 +47,11 @@ MIGRATE_SA="pdf-crawler-migrate"
 MIGRATE_SA_EMAIL="${MIGRATE_SA}@${PROJECT}.iam.gserviceaccount.com"
 MIGRATE_JOB="crawler-migrate"
 
+# The one place site modules are listed. Config upload, job creation, and the
+# closing "how to trigger" hints all derive from this, so adding a site here
+# updates every step — no more drift between the jobs and the printed commands.
+SITES=(ontario_legislative_bills toronto_bylaws ontario_elaws)
+
 echo "==> Project ${PROJECT} / region ${REGION}"
 gcloud config set project "${PROJECT}" >/dev/null
 
@@ -148,7 +153,7 @@ echo "    waiting 30s for IAM to propagate"
 sleep 30
 
 echo "==> Uploading site configs"
-for site in ontario_legislative_bills toronto_bylaws ontario_elaws; do
+for site in "${SITES[@]}"; do
   gcloud storage cp "${site}/config.yaml" "gs://${CONFIG_BUCKET}/sites/${site}.yaml"
 done
 
@@ -203,7 +208,7 @@ fi
 
 # One job per site: they have different runtimes and politeness budgets, and
 # separate jobs keep their logs, retries, and failures independently visible.
-for site in ontario_legislative_bills toronto_bylaws ontario_elaws; do
+for site in "${SITES[@]}"; do
   job="crawler-${site//_/-}"
   echo "==> Cloud Run Job ${job}"
 
@@ -279,18 +284,24 @@ if [[ ${verify_failed} -eq 1 ]]; then
   exit 1
 fi
 
+# Build the per-site trigger hints from the same list the jobs were created
+# from, so this can never list a different set than what was deployed.
+TRIGGER_HINTS=""
+for site in "${SITES[@]}"; do
+  TRIGGER_HINTS+="  gcloud run jobs execute crawler-${site//_/-} --region=${REGION}"$'\n'
+done
+FIRST_JOB="crawler-${SITES[0]//_/-}"
+
 cat <<EOF
 
 Deployed image: ${IMAGE}
 
 Done. Trigger a crawl manually:
 
-  gcloud run jobs execute crawler-toronto-bylaws --region=${REGION}
-  gcloud run jobs execute crawler-ontario-legislative-bills --region=${REGION}
+${TRIGGER_HINTS}
+Follow logs (any job):
 
-Follow logs:
-
-  gcloud beta run jobs logs tail crawler-toronto-bylaws --region=${REGION}
+  gcloud beta run jobs logs tail ${FIRST_JOB} --region=${REGION}
 
 PDFs:     gs://${PDF_BUCKET}/
 Metadata: Firestore collections 'documents', 'jobs', and 'checkpoints'
